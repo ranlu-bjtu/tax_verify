@@ -1,0 +1,10 @@
+company:
+  name: "测试企业A"
+  taxpayer_id: "91110108MA01XXXXXX"
+  province: "shandong"
+  task_id: "2063634154404978990"
+  tax_periods:
+    - "2026Q1"
+    - "2026Q2"
+  tax_types:
+    - "VAT_SMALL_SCALE"

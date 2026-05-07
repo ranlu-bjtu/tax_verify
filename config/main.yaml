@@ -1,0 +1,56 @@
+system:
+  name: "税务申报数据校验系统"
+  version: "1.0"
+  log_level: "INFO"
+
+browser:
+  channel: "chrome"
+  user_data_dir: "./browser_profile/etax_session"
+  plugin_path: "C:\\Users\\Administrator\\Downloads\\EtaxPlugin"
+  headless: false
+  login_timeout: 300
+  login_mode: "persistent_context"
+  cdp_port: 9222
+
+login_detection:
+  success_indicators:
+    - type: "url_pattern"
+      value: "*/main*"
+    - type: "element"
+      selector: ".user-info"
+    - type: "cookie"
+      name: "etax_session_token"
+
+data_source:
+  priority: ["web_dom", "pdf"]
+  always_download_pdf: true
+  fallback_on_dom_failure: true
+
+api:
+  timeout: 30
+  retry_count: 3
+  retry_delay: 5
+
+compare:
+  default_tolerance_amount: 0.01
+  default_tolerance_rate: 0.0001
+  treat_dash_as_zero: true
+  treat_empty_as_zero: false
+  empty_equivalent_values: ["——", "", "0.00", "0"]
+  date_format_api: "%Y-%m-%d"
+  date_format_web: "%Y年%m月%d日"
+
+report:
+  output_dir: "./output/reports"
+  formats: ["excel", "json", "console"]
+  include_raw_values: true
+
+scheduler:
+  enabled: false
+  cron: "0 8 * * *"
+
+hermes:
+  enabled: false
+  bridge_type: "cdp"
+  cdp_url: "ws://localhost:${browser.cdp_port:9222}"
+  skill_dir: "./config/hermes/skills"

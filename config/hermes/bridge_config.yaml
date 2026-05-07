@@ -1,0 +1,7 @@
+hermes:
+  enabled: false
+  bridge_type: "cdp"
+  cdp_url: "ws://localhost:9222"
+  skill_dir: "./config/hermes/skills"
+  model: "anthropic/claude-sonnet-4-6"
+  max_retries: 3

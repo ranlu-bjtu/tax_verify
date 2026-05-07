@@ -1,0 +1,65 @@
+tax_type:
+  tax_type_id: "VAT_SMALL_SCALE"
+  tax_type_name: "增值税（小规模纳税人适用）"
+  enabled: true
+  forms:
+    - form_code: "VAT_SMALL_SCALE_MAIN"
+      form_name: "增值税及附加税费申报表（小规模纳税人适用）主表"
+      form_version: "2026"
+      pages: 1
+      mapping_source: "web"
+      mapping_file: "./mappings/vat_small_scale_mapping.xlsx"
+      mapping_sheet: "增值税主表"
+      mapping_header_row: 2
+      mapping_data_start_row: 3
+      web_config:
+        url_template: "https://etax.shandong.chinatax.gov.cn:8443/loginb/"
+        login_required: true
+        navigation_steps:
+          - action: "click"
+            selector: "a:has-text('我要查询'), button:has-text('我要查询'), *:has-text('我要查询')"
+            wait_until: "domcontentloaded"
+            timeout: 10000
+            description: "点击'我要查询'菜单"
+          - action: "click"
+            selector: "a:has-text('一户式查询'), *:has-text('一户式查询')"
+            wait_until: "domcontentloaded"
+            timeout: 10000
+            description: "点击'一户式查询'子菜单"
+          - action: "click"
+            selector: "a:has-text('申报信息查询'), *:has-text('申报信息查询')"
+            wait_until: "domcontentloaded"
+            timeout: 10000
+            description: "点击'申报信息查询'"
+          - action: "wait"
+            selector: "table, .result-list, .data-list"
+            timeout: 15000
+            description: "等待查询结果列表页面加载"
+        result_list:
+          enabled: true
+          row_selector: "table tbody tr, .result-list > *, .data-list > *"
+          click_selector: "a, button, .view-btn, .detail-btn"
+          wait_after_click: 5000
+        table_selector: "table"
+        row_selector: "tr"
+        cell_selector: "td"
+      pdf_config:
+        parser_strategy: "table_extract"
+        table_regions:
+          - name: "main_table"
+            page: 1
+            bbox: [0, 50, 595, 700]
+      api_config:
+        base_url: "https://data-task-management.chanapp.chanjet.com/pub-tax-management/api/admin/task/getListByTaskId"
+        endpoint_template: "/{task_id}"
+        method: "GET"
+        headers:
+          Accept: "application/json"
+        response_json_path: "$.data[0].resultJson"
+        timeout_seconds: 30
+        retry_count: 3
+      compare_rules:
+        default_tolerance_amount: 0.01
+        default_tolerance_rate: 0.0001
+        treat_dash_as_zero: true
+        empty_equivalent_values: ["——", "", "0.00", "0"]

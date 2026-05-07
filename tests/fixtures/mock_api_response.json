@@ -1,0 +1,12 @@
+{
+  "data": {
+    "salesGoods3Percent": 10000.50,
+    "salesService3Percent": 5000.25,
+    "salesGoods5Percent": 3000.00,
+    "taxPeriod": "2026-01-01至2026-03-31",
+    "taxDueCurrent": 450.15,
+    "taxRate": 0.03,
+    "declareDate": "2026-04-15",
+    "taxExemptSales": "——"
+  }
+}

@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Local / generated
+output/
+browser_profile/
+
+# Secrets & env
+.env
+.env.*
+
+# Local agent (optional)
+.claude/

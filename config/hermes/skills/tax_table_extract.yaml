@@ -1,0 +1,13 @@
+skill:
+  name: "tax_table_extract"
+  description: "从税务申报表页面提取指定税种的表格数据"
+  trigger: "提取税表数据"
+  steps:
+    - action: "browser_snapshot"
+      args:
+        full: true
+    - action: "browser_console"
+      args:
+        expression: "(function() { var table = document.querySelector('{{table_selector}}'); return table ? JSON.stringify(table.innerText) : null; })()"
+  output_format: "json"
+  return_to: "python_compare_layer"
