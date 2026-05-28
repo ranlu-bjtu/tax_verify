@@ -1,0 +1,1 @@
+"""Yidaizhang collection automation helpers."""

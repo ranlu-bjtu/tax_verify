@@ -123,6 +123,19 @@ def test_compare_api_missing():
     assert r.status == CompareStatus.API_MISSING
 
 
+def test_appendix5_zero_empty_is_not_auto_match():
+    comp = Comparator()
+    n = get_normalizer(DataType.AMOUNT)
+    m = FieldMapping(
+        field_id="bqynse_cjs",
+        display_name="bqynse_cjs",
+        data_type=DataType.AMOUNT,
+        form_code="VAT_GENERAL_APPENDIX5",
+    )
+    r = comp.compare_field(m, n.normalize("0.00"), n.normalize(None))
+    assert r.status == CompareStatus.WEB_MISSING
+
+
 def test_compare_rate_match():
     comp = Comparator()
     n = get_normalizer(DataType.RATE)
@@ -184,6 +197,7 @@ if __name__ == "__main__":
     test_compare_tolerance_match()
     test_compare_mismatch()
     test_compare_api_missing()
+    test_appendix5_zero_empty_is_not_auto_match()
     test_compare_rate_match()
     test_compare_text_match()
     test_compare_date_match()

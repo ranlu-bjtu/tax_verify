@@ -12,6 +12,8 @@ build/
 # Local / generated
 output/
 browser_profile/
+/runtime/
+tax_nos*.txt
 
 # Secrets & env
 .env

@@ -31,10 +31,17 @@ console = Console()
 @click.option("--user-data-dir", default="./browser_profile/etax_compare_forms")
 @click.option("--plugin-path", default=r"C:\Users\Administrator\Downloads\EtaxPlugin")
 @click.option("--chanjet-timeout", default=300, type=int)
-@click.option("--tax-timeout", default=180, type=int)
+@click.option("--tax-timeout", default=600, type=int)
+@click.option(
+    "--tax-login-strategy",
+    type=click.Choice(["direct_first", "plugin_first"]),
+    default="direct_first",
+    help="Tax bureau login strategy for taskId verification.",
+)
 @click.option("--skip-api", is_flag=True, help="Only load workbook mappings; requires --targets not auto.")
 @click.option("--skip-browser", is_flag=True, help="Fetch API and mappings without opening tax pages.")
 @click.option("--skip-pdf", is_flag=True, help="Do not save a PDF copy of the compared tax page.")
+@click.option("--browser-lock-timeout", default=3600, type=int, help="Seconds to wait for the shared tax browser lock.")
 @click.option("--log-level", default="INFO")
 def main(
     config: str,
@@ -51,9 +58,11 @@ def main(
     plugin_path: str,
     chanjet_timeout: int,
     tax_timeout: int,
+    tax_login_strategy: str,
     skip_api: bool,
     skip_browser: bool,
     skip_pdf: bool,
+    browser_lock_timeout: int,
     log_level: str,
 ):
     """Tax declaration data verification system.
@@ -80,9 +89,11 @@ def main(
             plugin_path=plugin_path,
             chanjet_timeout=chanjet_timeout,
             tax_timeout=tax_timeout,
+            tax_login_strategy=tax_login_strategy,
             skip_api=skip_api,
             skip_browser=skip_browser,
             skip_pdf=skip_pdf,
+            browser_lock_timeout=browser_lock_timeout,
             log_level=log_level,
         )
         raise click.exceptions.Exit(exit_code)
@@ -180,35 +191,44 @@ def run_real_task_compare(
     plugin_path: str,
     chanjet_timeout: int,
     tax_timeout: int,
+    tax_login_strategy: str,
     skip_api: bool,
     skip_browser: bool,
     skip_pdf: bool,
+    browser_lock_timeout: int,
     log_level: str,
 ) -> int:
     """Run the canonical production comparison flow for a Chanjet task."""
     from scripts.compare_tax_forms import run_compare, setup_logging
+    from src.runtime.process_lock import DEFAULT_TAX_BROWSER_LOCK, ProcessLock
 
     config_root = config.rsplit("/", 1)[0] if "/" in config else config.rsplit("\\", 1)[0] if "\\" in config else "config"
     setup_logging(log_level)
     console.print("[bold cyan]Running real task comparison via canonical taskId flow[/bold cyan]")
-    return run_compare(
-        Namespace(
-            task_id=task_id,
-            targets=targets,
-            config_root=config_root,
-            cdp_port=cdp_port,
-            mode=mode,
-            user_data_dir=user_data_dir,
-            plugin_path=plugin_path,
-            chanjet_timeout=chanjet_timeout,
-            tax_timeout=tax_timeout,
-            skip_api=skip_api,
-            skip_browser=skip_browser,
-            skip_pdf=skip_pdf,
-            log_level=log_level,
-        )
+    compare_args = Namespace(
+        task_id=task_id,
+        targets=targets,
+        config_root=config_root,
+        cdp_port=cdp_port,
+        mode=mode,
+        user_data_dir=user_data_dir,
+        plugin_path=plugin_path,
+        chanjet_timeout=chanjet_timeout,
+        tax_timeout=tax_timeout,
+        tax_login_strategy=tax_login_strategy,
+        skip_api=skip_api,
+        skip_browser=skip_browser,
+        skip_pdf=skip_pdf,
+        log_level=log_level,
     )
-
+    if skip_browser:
+        return run_compare(compare_args)
+    with ProcessLock(
+        DEFAULT_TAX_BROWSER_LOCK,
+        timeout=browser_lock_timeout,
+        owner={"kind": "tax-verify", "taskId": task_id},
+    ):
+        return run_compare(compare_args)
 
 if __name__ == "__main__":
     main()

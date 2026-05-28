@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>批量取数验证命令生成器</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --surface: #ffffff;
+      --ink: #17212f;
+      --muted: #667085;
+      --line: #d6dde8;
+      --focus: #2563eb;
+      --ok: #0f766e;
+      --warn: #9a6700;
+      --danger: #b42318;
+      --code-bg: #111827;
+      --code-text: #e5edf6;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+
+    header {
+      padding: 18px 24px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.3;
+      letter-spacing: 0;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(360px, 520px) minmax(420px, 1fr);
+      gap: 18px;
+      padding: 18px 24px 28px;
+    }
+
+    section {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .section-title {
+      margin: 0;
+      padding: 12px 14px;
+      font-size: 15px;
+      border-bottom: 1px solid var(--line);
+      background: #f9fbfd;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      padding: 14px;
+    }
+
+    .full {
+      grid-column: 1 / -1;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      color: #344054;
+      margin-bottom: 5px;
+    }
+
+    input,
+    select,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      padding: 8px 9px;
+      font: inherit;
+      min-height: 36px;
+    }
+
+    textarea {
+      min-height: 82px;
+      resize: vertical;
+    }
+
+    input:focus,
+    select:focus,
+    textarea:focus,
+    button:focus {
+      outline: 2px solid rgba(37, 99, 235, 0.24);
+      outline-offset: 1px;
+      border-color: var(--focus);
+    }
+
+    .segmented,
+    .checks {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .segmented input,
+    .checks input {
+      width: auto;
+      min-height: auto;
+      margin: 0;
+    }
+
+    .segmented label,
+    .checks label {
+      margin: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      padding: 7px 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      cursor: pointer;
+    }
+
+    .commands {
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+    }
+
+    .command-block {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .command-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #f9fbfd;
+    }
+
+    .command-title {
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 6px;
+      padding: 7px 10px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button.primary {
+      background: var(--focus);
+      color: #fff;
+      border-color: var(--focus);
+    }
+
+    pre {
+      margin: 0;
+      min-height: 74px;
+      padding: 12px;
+      overflow: auto;
+      background: var(--code-bg);
+      color: var(--code-text);
+      font: 13px/1.5 Consolas, "Courier New", monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .status-line {
+      min-height: 24px;
+      color: var(--ok);
+      font-size: 13px;
+      padding: 0 14px 14px;
+    }
+
+    @media (max-width: 980px) {
+      main {
+        grid-template-columns: 1fr;
+        padding: 12px;
+      }
+
+      header {
+        padding: 14px 12px 10px;
+      }
+    }
+
+    @media (max-width: 620px) {
+      .form-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>批量取数验证命令生成器</h1>
+  </header>
+
+  <main>
+    <section>
+      <h2 class="section-title">参数</h2>
+      <div class="form-grid">
+        <div class="full">
+          <label>终端</label>
+          <div class="segmented">
+            <label><input type="radio" name="shell" value="cmd" checked> cmd</label>
+            <label><input type="radio" name="shell" value="powershell"> PowerShell</label>
+          </div>
+        </div>
+
+        <div class="full">
+          <label>执行模式</label>
+          <select id="mode">
+            <option value="full">批量取数并验证</option>
+            <option value="collect">只发起取数并解析 taskId</option>
+            <option value="verify">基于已有 state.json 重新验证</option>
+          </select>
+        </div>
+
+        <div>
+          <label>易代账账号</label>
+          <input id="username" value="" autocomplete="username" placeholder="运行前填写">
+        </div>
+        <div>
+          <label>易代账密码</label>
+          <input id="password" value="" type="password" autocomplete="current-password" placeholder="运行前填写">
+        </div>
+
+        <div>
+          <label>期间</label>
+          <input id="period" value="202604">
+        </div>
+        <div>
+          <label>企业</label>
+          <input id="enterprise" value="蓝天之爱">
+        </div>
+
+        <div>
+          <label>税号文件</label>
+          <input id="taxFile" value="tax_nos.txt">
+        </div>
+        <div>
+          <label>runId</label>
+          <input id="runId" placeholder="自动生成；重新验证时填写">
+        </div>
+
+        <div>
+          <label>targets</label>
+          <input id="targets" value="auto">
+        </div>
+        <div>
+          <label>日志级别</label>
+          <select id="logLevel">
+            <option>INFO</option>
+            <option>DEBUG</option>
+            <option>WARNING</option>
+            <option>ERROR</option>
+          </select>
+        </div>
+
+        <div>
+          <label>CDP 端口</label>
+          <input id="cdpPort" value="9222">
+        </div>
+        <div>
+          <label>锁等待秒数</label>
+          <input id="lockTimeout" value="3600">
+        </div>
+
+        <div>
+          <label>轮询间隔秒数</label>
+          <input id="pollInterval" value="15">
+        </div>
+        <div>
+          <label>轮询超时秒数</label>
+          <input id="pollTimeout" value="600">
+        </div>
+
+        <div class="full">
+          <label>Chrome 用户目录</label>
+          <input id="userDataDir" value="C:\Users\Administrator\tax_verify\browser_profile\etax_compare_forms">
+        </div>
+
+        <div class="full">
+          <label>EtaxPlugin 路径</label>
+          <input id="pluginPath" value="C:\Users\Administrator\Downloads\EtaxPlugin">
+        </div>
+
+        <div class="full">
+          <label>输出目录</label>
+          <input id="outputDir" value="output\batch_runs">
+        </div>
+
+        <div class="full">
+          <label>税号直接输入</label>
+          <textarea id="taxNos" placeholder="不使用税号文件时填写，一行一个或逗号分隔"></textarea>
+        </div>
+
+        <div class="full">
+          <label>开关</label>
+          <div class="checks">
+            <label><input id="force" type="checkbox" checked> force</label>
+            <label><input id="skipBrowser" type="checkbox"> skip-browser</label>
+            <label><input id="skipPdf" type="checkbox"> skip-pdf</label>
+            <label><input id="rerunVerified" type="checkbox"> rerun-verified</label>
+            <label><input id="multiline" type="checkbox" checked> 多行命令</label>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="section-title">命令</h2>
+      <div class="commands">
+        <div class="command-block">
+          <div class="command-head">
+            <div class="command-title">启动 Chrome</div>
+            <button data-copy="chromeCmd">复制</button>
+          </div>
+          <pre id="chromeCmd"></pre>
+        </div>
+
+        <div class="command-block">
+          <div class="command-head">
+            <div class="command-title">设置账号密码</div>
+            <button data-copy="envCmd">复制</button>
+          </div>
+          <pre id="envCmd"></pre>
+        </div>
+
+        <div class="command-block">
+          <div class="command-head">
+            <div class="command-title">批量命令</div>
+            <button data-copy="batchCmd">复制</button>
+          </div>
+          <pre id="batchCmd"></pre>
+        </div>
+
+        <div class="command-block">
+          <div class="command-head">
+            <div class="command-title">完整命令</div>
+            <button class="primary" data-copy="allCmd">复制全部</button>
+          </div>
+          <pre id="allCmd"></pre>
+        </div>
+      </div>
+      <div id="status" class="status-line"></div>
+    </section>
+  </main>
+
+  <script>
+    const ids = [
+      'mode', 'username', 'password', 'period', 'enterprise', 'taxFile', 'runId',
+      'targets', 'logLevel', 'cdpPort', 'lockTimeout', 'pollInterval', 'pollTimeout',
+      'userDataDir', 'pluginPath', 'outputDir', 'taxNos', 'force', 'skipBrowser',
+      'skipPdf', 'rerunVerified', 'multiline'
+    ];
+
+    function value(id) {
+      const el = document.getElementById(id);
+      return el.type === 'checkbox' ? el.checked : el.value.trim();
+    }
+
+    function shell() {
+      return document.querySelector('input[name="shell"]:checked').value;
+    }
+
+    function quoteCmd(text) {
+      return `"${String(text).replace(/"/g, '\\"')}"`;
+    }
+
+    function quotePwsh(text) {
+      return `'${String(text).replace(/'/g, "''")}'`;
+    }
+
+    function arg(name, val, isPath = false) {
+      if (val === '' || val === false || val == null) return [];
+      const q = shell() === 'powershell' ? quotePwsh : quoteCmd;
+      return [name, isPath || /\s|[^\x00-\x7F]/.test(String(val)) ? q(val) : String(val)];
+    }
+
+    function flag(name, enabled) {
+      return enabled ? [name] : [];
+    }
+
+    function lineJoin(parts) {
+      if (!value('multiline')) return parts.join(' ');
+      const joiner = shell() === 'powershell' ? ' `\n  ' : ' ^\n  ';
+      return parts.join(joiner);
+    }
+
+    function taxArgs() {
+      const inline = value('taxNos')
+        .split(/[\n,]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (inline.length) {
+        return inline.flatMap((taxNo) => arg('--tax-no', taxNo));
+      }
+      return arg('--tax-no-file', value('taxFile'), true);
+    }
+
+    function buildChromeCommand() {
+      const chromePath = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+      if (shell() === 'powershell') {
+        return [
+          `Start-Process -FilePath ${quotePwsh(chromePath)} -ArgumentList @(`,
+          `  '--load-extension=${value('pluginPath')}',`,
+          `  '--user-data-dir=${value('userDataDir')}',`,
+          `  '--remote-debugging-port=${value('cdpPort')}',`,
+          `  '--no-first-run',`,
+          `  '--no-default-browser-check'`,
+          `) -WindowStyle Hidden`
+        ].join('\n');
+      }
+      return [
+        'start "" ' + quoteCmd(chromePath),
+        '  --load-extension=' + quoteCmd(value('pluginPath')),
+        '  --user-data-dir=' + quoteCmd(value('userDataDir')),
+        '  --remote-debugging-port=' + value('cdpPort'),
+        '  --no-first-run',
+        '  --no-default-browser-check'
+      ].join(' ^\n');
+    }
+
+    function buildEnvCommand() {
+      if (shell() === 'powershell') {
+        return [
+          `$env:YDZ_USERNAME=${quotePwsh(value('username'))}`,
+          `$env:YDZ_PASSWORD=${quotePwsh(value('password'))}`
+        ].join('\n');
+      }
+      return [
+        `set YDZ_USERNAME=${value('username')}`,
+        `set YDZ_PASSWORD=${value('password')}`
+      ].join('\n');
+    }
+
+    function buildBatchCommand() {
+      const mode = value('mode');
+      const parts = ['python', 'scripts\\batch_collect_verify.py'];
+      parts.push(...taxArgs());
+      parts.push(...arg('--period', value('period')));
+      parts.push(...arg('--enterprise', value('enterprise'), true));
+      parts.push(...arg('--output-dir', value('outputDir'), true));
+      parts.push(...arg('--targets', value('targets')));
+      parts.push(...arg('--log-level', value('logLevel')));
+      parts.push(...arg('--cdp-port', value('cdpPort')));
+      parts.push(...arg('--user-data-dir', value('userDataDir'), true));
+      parts.push(...arg('--plugin-path', value('pluginPath'), true));
+      parts.push(...arg('--poll-interval', value('pollInterval')));
+      parts.push(...arg('--poll-timeout', value('pollTimeout')));
+      parts.push(...arg('--browser-lock-timeout', value('lockTimeout')));
+      parts.push(...arg('--run-id', value('runId')));
+      parts.push(...flag('--force', value('force') && mode !== 'verify'));
+      parts.push(...flag('--verify', mode !== 'collect'));
+      parts.push(...flag('--skip-collect', mode === 'verify'));
+      parts.push(...flag('--skip-browser', value('skipBrowser')));
+      parts.push(...flag('--skip-pdf', value('skipPdf')));
+      parts.push(...flag('--rerun-verified', value('rerunVerified')));
+      return lineJoin(parts);
+    }
+
+    function render() {
+      const chrome = buildChromeCommand();
+      const env = buildEnvCommand();
+      const batch = buildBatchCommand();
+      document.getElementById('chromeCmd').textContent = chrome;
+      document.getElementById('envCmd').textContent = env;
+      document.getElementById('batchCmd').textContent = batch;
+      document.getElementById('allCmd').textContent = [chrome, env, batch].join('\n\n');
+    }
+
+    async function copyText(id) {
+      const text = document.getElementById(id).textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+      }
+      const status = document.getElementById('status');
+      status.textContent = '已复制';
+      window.setTimeout(() => { status.textContent = ''; }, 1600);
+    }
+
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      el.addEventListener('input', render);
+      el.addEventListener('change', render);
+    }
+    for (const el of document.querySelectorAll('input[name="shell"]')) {
+      el.addEventListener('change', render);
+    }
+    for (const btn of document.querySelectorAll('[data-copy]')) {
+      btn.addEventListener('click', () => copyText(btn.dataset.copy));
+    }
+    render();
+  </script>
+</body>
+</html>

@@ -45,6 +45,31 @@ class LoginDetector:
         on_main = False
         not_on_login = True
 
+        try:
+            text = page.evaluate("document.body ? document.body.innerText.slice(0, 5000) : ''")
+            logged_in_hints = (
+                "\u6211\u8981\u67e5\u8be2",
+                "\u6211\u8981\u529e\u7a0e",
+                "\u672c\u671f\u5e94\u7533\u62a5",
+                "\u6211\u7684\u5f85\u529e",
+                "\u7edf\u4e00\u793e\u4f1a\u4fe1\u7528\u4ee3\u7801",
+                "\u7eb3\u7a0e\u4eba\u8bc6\u522b\u53f7",
+                "\u8ddd\u672c\u6708\u5f81\u671f\u7ed3\u675f",
+                "\u66f4\u6b63\u4f5c\u5e9f",
+            )
+            login_only_hints = (
+                "\u201c\u591a\u5408\u4e00\u201d\u767b\u5f55",
+                "\u6253\u5f00\u7535\u5b50\u7a0e\u52a1\u5c40APP\u626b\u4e00\u626b",
+            )
+            if any(hint in text for hint in logged_in_hints):
+                logger.info(f"Login detected: logged-in tax bureau content found ({url})")
+                return True
+            if any(hint in text for hint in login_only_hints):
+                logger.info(f"Not logged in: login form content found url={url}")
+                return False
+        except Exception:
+            pass
+
         for indicator in self.indicators:
             indicator_type = indicator.get("type")
 

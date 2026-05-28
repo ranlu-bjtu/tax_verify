@@ -7,3 +7,4 @@ click>=8.3
 rich>=14.0
 python-dotenv>=1.2
 jsonpath-ng>=1.6
+requests>=2.31

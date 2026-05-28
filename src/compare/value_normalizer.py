@@ -29,6 +29,7 @@ class AmountNormalizer:
             return NormalizedValue(value=None, original=raw_value, is_empty=True)
 
         s = str(raw_value).replace(",", "").replace("￥", "").replace("¥", "").strip()
+        s = "".join(s.split())
         if s in DASH_VALUES:
             return NormalizedValue(value=None, original=raw_value, is_empty=True)
 

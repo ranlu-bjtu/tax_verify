@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import subprocess
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -57,14 +59,19 @@ class TaskLoginFlow:
         self,
         browser_manager: BrowserManager,
         timeout: int = 180,
-        poll_timeout: int = 60,
+        poll_timeout: int | None = None,
+        login_strategy: str = "direct_first",
     ):
         self.bm = browser_manager
         self.timeout = timeout
-        self.poll_timeout = poll_timeout
+        self.poll_timeout = poll_timeout if poll_timeout is not None else max(60, timeout)
+        self.login_strategy = login_strategy if login_strategy in {"direct_first", "plugin_first"} else "direct_first"
 
     def login(self, chanjet_page: Page, outer_task_id: str) -> tuple[Page, TaskLoginInfo]:
         """Run the task-login flow and return the logged-in tax page."""
+        login_start = time.time()
+        self.close_tax_pages()
+        self.ensure_plugin_bridge(chanjet_page)
         machine_id = self._get_machine_id(chanjet_page)
         client_job = self.get_client_job(chanjet_page, outer_task_id)
         info = self._build_info_from_client_job(
@@ -90,50 +97,124 @@ class TaskLoginFlow:
         info.current_task_id = self._current_task_id(task_cookie) or info.inner_task_id
 
         self.close_tax_pages()
-        self.dispatch_open_tax_tab(chanjet_page, info)
+        if self.login_strategy == "plugin_first":
+            self.dispatch_open_tax_tab(chanjet_page, info)
+            wait_start = time.time()
+            tax_page = self.wait_for_tax_page(info.province, timeout=min(8, self.timeout))
+            logger.info("Tax bureau first-page wait elapsed: %.1fs", time.time() - wait_start)
+            if not tax_page:
+                logger.warning(
+                    "EtaxPlugin did not open a logged-in tax page before timeout; opening tpass login URL directly"
+                )
+                tax_page = self.open_login_url_directly(info)
+        else:
+            logger.info("Opening tpass login URL directly for province=%s", info.province)
+            try:
+                tax_page = self.open_login_url_directly(info)
+            except Exception as exc:
+                logger.warning("Direct tpass login failed; will try EtaxPlugin fallback: %s", exc)
+                tax_page = None
 
-        tax_page = self.wait_for_tax_page(info.province, timeout=self.timeout)
         if not tax_page:
-            logger.warning(
-                "EtaxPlugin did not open a logged-in tax page before timeout; opening tpass login URL directly"
-            )
-            page = self.bm.new_page()
-            page.goto(info.login_url, wait_until="domcontentloaded", timeout=30000)
-            tax_page = self.wait_for_tax_page(info.province, timeout=min(60, self.timeout))
+            if self.login_strategy != "plugin_first":
+                logger.warning("Direct tpass login did not complete; trying EtaxPlugin open-tab fallback")
+                self.close_tax_pages()
+                self.dispatch_open_tax_tab(chanjet_page, info)
+                tax_page = self.wait_for_tax_page(info.province, timeout=min(120, max(60, self.timeout)))
         if not tax_page:
             raise TimeoutError(f"Tax bureau login timeout for province={info.province}")
+        logger.info("Task tax login flow elapsed: %.1fs", time.time() - login_start)
         return tax_page, info
+
+    def open_login_url_directly(self, info: TaskLoginInfo) -> Optional[Page]:
+        page = self.find_tax_login_page(info.province) or self.bm.new_page()
+        page.goto(info.login_url, wait_until="domcontentloaded", timeout=30000)
+        fallback_timeout = min(120, max(60, self.timeout))
+        return self.wait_for_tax_page(info.province, timeout=fallback_timeout)
+
+    def ensure_plugin_bridge(self, page: Page, timeout: int = 12) -> bool:
+        """Ensure EtaxPlugin content scripts are injected before dispatching login events."""
+
+        if self._has_plugin_bridge(page, timeout=timeout):
+            return True
+
+        logger.info("EtaxPlugin bridge not ready on Chanjet page; reloading page before tax login")
+        try:
+            page.reload(wait_until="load", timeout=30000)
+        except Exception as exc:
+            logger.warning("Chanjet page reload for EtaxPlugin bridge failed: %s", exc)
+
+        if self._has_plugin_bridge(page, timeout=timeout):
+            logger.info("EtaxPlugin bridge became ready after Chanjet page reload")
+            return True
+
+        logger.warning("EtaxPlugin bridge is still unavailable after reload; direct tpass fallback may be slower")
+        return False
+
+    def _has_plugin_bridge(self, page: Page, timeout: int = 0) -> bool:
+        deadline = time.time() + max(timeout, 0)
+        while True:
+            try:
+                if page.evaluate("() => typeof window.etaxPlugin_getApiRoot === 'function'"):
+                    return True
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
 
     def get_client_job(self, page: Page, outer_task_id: str) -> dict[str, Any]:
         """Call getClientJob from the Chanjet page so auth headers are available."""
-        logger.info("Calling getClientJob for outer taskId: %s", outer_task_id)
-        try:
-            result = page.evaluate(
-                """async ({url, taskId}) => {
-                    const requestUrl = `${url}?taskId=${taskId}&orgLoginType=NATIONAL&etaxPluginVersion=2.1.0.109`;
-                    const auth = sessionStorage.getItem('Authorization') || '';
-                    const accessToken = sessionStorage.getItem('access_token') || '';
-                    const headers = { "Content-Type": "application/json" };
-                    if (auth) headers["authorization"] = auth.startsWith('Bearer ') ? auth : "Bearer " + auth;
-                    if (accessToken) headers["token"] = accessToken;
-                    const resp = await fetch(requestUrl, {
-                        method: "GET",
-                        headers,
-                        credentials: "include",
-                    });
-                    return await resp.json();
-                }""",
-                {"url": GET_CLIENT_JOB_URL, "taskId": outer_task_id},
-            )
-        except Exception as exc:
-            logger.warning("Browser getClientJob failed, falling back to Python requests: %s", exc)
-            result = self._get_client_job_with_requests(page, outer_task_id)
+        deadline = time.time() + max(45, min(self.timeout, 600))
+        attempt = 0
+        while True:
+            attempt += 1
+            logger.info("Calling getClientJob for outer taskId: %s (attempt %s)", outer_task_id, attempt)
+            try:
+                result = page.evaluate(
+                    """async ({url, taskId}) => {
+                        const requestUrl = `${url}?taskId=${taskId}&orgLoginType=NATIONAL&etaxPluginVersion=2.1.0.109`;
+                        const auth = sessionStorage.getItem('Authorization') || '';
+                        const accessToken = sessionStorage.getItem('access_token') || '';
+                        const headers = { "Content-Type": "application/json" };
+                        if (auth) headers["authorization"] = auth.startsWith('Bearer ') ? auth : "Bearer " + auth;
+                        if (accessToken) headers["token"] = accessToken;
+                        const resp = await fetch(requestUrl, {
+                            method: "GET",
+                            headers,
+                            credentials: "include",
+                        });
+                        return await resp.json();
+                    }""",
+                    {"url": GET_CLIENT_JOB_URL, "taskId": outer_task_id},
+                )
+            except Exception as exc:
+                logger.warning("Browser getClientJob failed, falling back to Python requests: %s", exc)
+                result = self._get_client_job_with_requests(page, outer_task_id)
 
-        if not isinstance(result, dict):
-            raise RuntimeError("getClientJob returned a non-object response")
-        if result.get("flag") == 0 or result.get("success") is False:
-            raise RuntimeError(f"getClientJob failed: {result.get('msg') or result.get('message')}")
-        return result
+            if not isinstance(result, dict):
+                raise RuntimeError("getClientJob returned a non-object response")
+            if result.get("flag") == 0 or result.get("success") is False:
+                message = result.get("msg") or result.get("message") or ""
+                if self._is_pending_client_job_message(message) and time.time() < deadline:
+                    logger.warning("getClientJob is blocked by a pending tax-login job; waiting before retry: %s", message)
+                    self.close_tax_pages()
+                    time.sleep(min(15, max(1, deadline - time.time())))
+                    continue
+                raise RuntimeError(f"getClientJob failed: {message}")
+            if not self._client_job_has_login_metadata(result):
+                summary = self._client_job_response_summary(result)
+                if time.time() < deadline:
+                    logger.warning(
+                        "getClientJob returned success but tax-login metadata is incomplete; retrying: %s",
+                        summary,
+                    )
+                    time.sleep(min(5, max(1, deadline - time.time())))
+                    continue
+                raise RuntimeError(f"getClientJob returned incomplete tax-login metadata: {summary}")
+            return result
+
+        raise RuntimeError("getClientJob failed after retries")
 
     def _get_client_job_with_requests(self, page: Page, outer_task_id: str) -> dict[str, Any]:
         tokens = page.evaluate(
@@ -157,18 +238,71 @@ class TaskLoginFlow:
         if access_token:
             headers["token"] = access_token
 
-        resp = requests.get(
-            GET_CLIENT_JOB_FALLBACK_URL,
-            params={
-                "taskId": outer_task_id,
-                "orgLoginType": "NATIONAL",
-                "etaxPluginVersion": "2.1.0.109",
-            },
-            headers=headers,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        params = {
+            "taskId": outer_task_id,
+            "orgLoginType": "NATIONAL",
+            "etaxPluginVersion": "2.1.0.109",
+        }
+        try:
+            resp = requests.get(
+                GET_CLIENT_JOB_FALLBACK_URL,
+                params=params,
+                headers=headers,
+                timeout=20,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            if self._should_try_curl_fallback(exc):
+                result = self._get_client_job_with_curl(headers, params, timeout=20)
+                if result is not None:
+                    return result
+            raise
+
+    def _get_client_job_with_curl(
+        self,
+        headers: dict[str, str],
+        params: dict[str, str],
+        timeout: int,
+    ) -> dict[str, Any] | None:
+        curl_path = shutil.which("curl.exe") or shutil.which("curl")
+        if not curl_path:
+            return None
+        url = f"{GET_CLIENT_JOB_FALLBACK_URL}?{urllib.parse.urlencode(params)}"
+        command = [
+            curl_path,
+            "-L",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            str(timeout),
+        ]
+        for key, value in headers.items():
+            command.extend(["-H", f"{key}: {value}"])
+        command.append(url)
+        try:
+            logger.warning("Requests getClientJob failed; retrying with curl fallback")
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout + 5,
+                check=False,
+            )
+            if completed.returncode != 0:
+                logger.error("curl getClientJob fallback failed: %s", completed.stderr.strip())
+                return None
+            return json.loads(completed.stdout)
+        except Exception as exc:
+            logger.error("curl getClientJob fallback raised error: %s", exc)
+            return None
+
+    @staticmethod
+    def _should_try_curl_fallback(exc: Exception) -> bool:
+        text = str(exc)
+        return "SSLEOFError" in text or "UNEXPECTED_EOF_WHILE_READING" in text
 
     def get_task_cookie(
         self,
@@ -207,7 +341,10 @@ class TaskLoginFlow:
                 raise RuntimeError(f"getTaskCookie failed: {last_message}")
             time.sleep(3)
 
-        raise TimeoutError(f"getTaskCookie polling timeout: {last_message}")
+        elapsed = int(time.time() - start)
+        raise TimeoutError(
+            f"getTaskCookie polling timeout after {elapsed}s/{self.poll_timeout}s: {last_message}"
+        )
 
     def build_login_url(self, task_cookie: dict[str, Any], client_job: dict[str, Any]) -> str:
         """Build the tpass login URL exactly like EtaxPlugin userLogin does."""
@@ -264,9 +401,7 @@ class TaskLoginFlow:
         tax_domains = get_tax_domains(info.province)
         logger.info("Dispatching clearTaxCookiesAndOpenNewTab for province=%s", info.province)
 
-        has_plugin_bridge = chanjet_page.evaluate(
-            "() => typeof window.etaxPlugin_getApiRoot === 'function'"
-        )
+        has_plugin_bridge = self._has_plugin_bridge(chanjet_page, timeout=3)
         if not has_plugin_bridge:
             logger.warning(
                 "EtaxPlugin bridge was not detected; opening tpass login URL directly without cookie cleanup"
@@ -309,23 +444,66 @@ class TaskLoginFlow:
         detector = LoginDetector(province=province)
         target_host = f"etax.{province}.chinatax.gov.cn"
         start = time.time()
+        last_status_log = 0.0
 
         while time.time() - start < timeout:
-            for page in self.bm.get_all_pages():
-                try:
-                    url = page.url or ""
-                    if target_host not in url:
-                        continue
-                    if "tpass" in url:
-                        continue
-                    if detector.is_logged_in(page) or self._looks_like_tax_portal(page):
-                        logger.info("Tax bureau logged in: %s", url)
-                        return page
-                except Exception:
-                    continue
-            time.sleep(3)
+            page = self._find_logged_in_tax_page(detector, target_host)
+            if page:
+                return page
+            elapsed = time.time() - start
+            if elapsed - last_status_log >= 5:
+                logger.info(
+                    "Waiting for tax bureau login: elapsed=%.0fs timeout=%ss pages=%s",
+                    elapsed,
+                    timeout,
+                    self._tax_page_status(target_host),
+                )
+                last_status_log = elapsed
+            time.sleep(1)
 
+        return self._find_logged_in_tax_page(detector, target_host)
+
+    def _find_logged_in_tax_page(self, detector: LoginDetector, target_host: str) -> Optional[Page]:
+        for page in self.bm.get_all_pages():
+            try:
+                url = page.url or ""
+                if target_host not in url:
+                    continue
+                if "tpass" in url and "#/login" in url:
+                    continue
+                if detector.is_logged_in(page) or self._looks_like_tax_portal(page):
+                    logger.info("Tax bureau logged in: %s", url)
+                    return page
+            except Exception:
+                continue
         return None
+
+    def find_tax_login_page(self, province: str) -> Optional[Page]:
+        tpass_host = f"tpass.{province}.chinatax.gov.cn"
+        etax_host = f"etax.{province}.chinatax.gov.cn"
+        for page in reversed(self.bm.get_all_pages()):
+            try:
+                url = page.url or ""
+                if tpass_host in url or etax_host in url:
+                    page.bring_to_front()
+                    return page
+            except Exception:
+                continue
+        return None
+
+    def _tax_page_status(self, target_host: str) -> str:
+        statuses: list[str] = []
+        for page in self.bm.get_all_pages():
+            try:
+                url = page.url or ""
+                if "chinatax.gov.cn" not in url:
+                    continue
+                text = page.evaluate("document.body ? document.body.innerText.slice(0, 120) : ''")
+                text = " ".join(str(text or "").split())
+                statuses.append(f"{url} | {text[:80]}")
+            except Exception:
+                continue
+        return " || ".join(statuses) or f"no {target_host} page"
 
     def _looks_like_tax_portal(self, page: Page) -> bool:
         try:
@@ -335,6 +513,16 @@ class TaskLoginFlow:
             text = page.evaluate("document.body ? document.body.innerText.slice(0, 3000) : ''")
         except Exception:
             return False
+        logged_in_hints = (
+            "\u6211\u8981\u67e5\u8be2",
+            "\u6211\u8981\u529e\u7a0e",
+            "\u7533\u62a5\u4fe1\u606f\u67e5\u8be2",
+            "\u672c\u671f\u5e94\u7533\u62a5",
+            "\u7edf\u4e00\u793e\u4f1a\u4fe1\u7528\u4ee3\u7801",
+            "\u7eb3\u7a0e\u4eba\u8bc6\u522b\u53f7",
+        )
+        if any(hint in text for hint in logged_in_hints):
+            return True
         return (
             "我要查询" in text
             or "我要办税" in text
@@ -364,14 +552,20 @@ class TaskLoginFlow:
         client_job: dict[str, Any],
     ) -> TaskLoginInfo:
         data = client_job.get("data") or {}
-        inner_task_id = self._get(data, "tydl.cookies.taskInfo.taskId", "")
-        province = self._get(data, "declareJob.province", "") or self._get(data, "tydl.cookies.taskInfo.province", "")
+        inner_task_id = self._client_job_inner_task_id(data)
+        province = self._client_job_province(data)
         tax_no = self._get(data, "tydl.taxNo", "") or self._get(data, "declareJob.taxNo", "")
 
         if not inner_task_id:
-            raise ValueError("Cannot resolve inner taskId from getClientJob response")
+            raise ValueError(
+                f"Cannot resolve inner taskId from getClientJob response: "
+                f"{self._client_job_response_summary(client_job)}"
+            )
         if not province:
-            raise ValueError("Cannot resolve province from getClientJob response")
+            raise ValueError(
+                f"Cannot resolve province from getClientJob response: "
+                f"{self._client_job_response_summary(client_job)}"
+            )
 
         return TaskLoginInfo(
             outer_task_id=outer_task_id,
@@ -393,6 +587,65 @@ class TaskLoginFlow:
 
     def _current_task_id(self, task_cookie: dict[str, Any]) -> str:
         return self._get(task_cookie.get("data") or {}, "tydl.cookies.taskInfo.taskId", "")
+
+    def _client_job_has_login_metadata(self, client_job: dict[str, Any]) -> bool:
+        data = client_job.get("data") or {}
+        return bool(self._client_job_inner_task_id(data) and self._client_job_province(data))
+
+    def _client_job_inner_task_id(self, data: dict[str, Any]) -> str:
+        for path in (
+            "tydl.cookies.taskInfo.taskId",
+            "tydl.taskInfo.taskId",
+            "taskInfo.taskId",
+            "declareJob.taskInfo.taskId",
+        ):
+            value = self._get(data, path, "")
+            if value:
+                return str(value)
+        return ""
+
+    def _client_job_province(self, data: dict[str, Any]) -> str:
+        for path in (
+            "declareJob.province",
+            "tydl.cookies.taskInfo.province",
+            "tydl.taskInfo.province",
+            "taskInfo.province",
+        ):
+            value = self._get(data, path, "")
+            if value:
+                return str(value)
+        return ""
+
+    def _client_job_response_summary(self, client_job: dict[str, Any]) -> dict[str, Any]:
+        data = client_job.get("data") if isinstance(client_job, dict) else None
+        data = data if isinstance(data, dict) else {}
+        tydl = data.get("tydl") if isinstance(data.get("tydl"), dict) else {}
+        cookies = tydl.get("cookies") if isinstance(tydl.get("cookies"), dict) else {}
+        task_info = cookies.get("taskInfo") if isinstance(cookies.get("taskInfo"), dict) else {}
+        declare_job = data.get("declareJob") if isinstance(data.get("declareJob"), dict) else {}
+        return {
+            "flag": client_job.get("flag") if isinstance(client_job, dict) else None,
+            "code": client_job.get("code") if isinstance(client_job, dict) else None,
+            "success": client_job.get("success") if isinstance(client_job, dict) else None,
+            "message": (client_job.get("msg") or client_job.get("message") or "") if isinstance(client_job, dict) else "",
+            "dataKeys": sorted(data.keys()),
+            "tydlKeys": sorted(tydl.keys()),
+            "cookieKeys": sorted(cookies.keys()),
+            "taskInfoKeys": sorted(task_info.keys()),
+            "hasInnerTaskId": bool(self._client_job_inner_task_id(data)),
+            "province": self._client_job_province(data),
+            "hasDeclareJob": bool(declare_job),
+            "hasTaxNo": bool(self._get(data, "tydl.taxNo", "") or self._get(data, "declareJob.taxNo", "")),
+        }
+
+    def _is_pending_client_job_message(self, message: str) -> bool:
+        return (
+            "正在执行进税局任务" in message
+            or "请您耐心等待" in message
+            or "之前执行过" in message
+            or "暂未完成" in message
+            or "耐心等待" in message
+        )
 
     def _get(self, data: dict[str, Any], dotted_path: str, default: Any = "") -> Any:
         current: Any = data

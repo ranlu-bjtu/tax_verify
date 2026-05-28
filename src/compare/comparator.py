@@ -51,7 +51,7 @@ class Comparator:
             )
 
         # Missing value handling — treat as missing if original was never provided
-        if self._zero_empty_equivalent(data_type, api_normalized, web_normalized):
+        if mapping.form_code != "VAT_GENERAL_APPENDIX5" and self._zero_empty_equivalent(data_type, api_normalized, web_normalized):
             return self._make_result(mapping, api_normalized, web_normalized,
                                      CompareStatus.MATCH, "zero_empty_equivalent")
 

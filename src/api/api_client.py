@@ -1,5 +1,7 @@
 import json
 import logging
+import shutil
+import subprocess
 import time
 from typing import Any, Optional
 
@@ -46,51 +48,97 @@ class APIClient:
                 resp = self.session.get(url, timeout=timeout)
                 resp.raise_for_status()
                 body = resp.json()
-
-                if not body.get("success"):
-                    logger.warning(f"API returned unsuccessful response: {body.get('msg')}")
-                    if attempt < retries:
-                        time.sleep(delay)
-                        continue
-                    return {"error": body.get("msg", "Unknown error"), "raw": body}
-
-                data_list = body.get("data", [])
-                if not data_list:
-                    logger.warning("API returned empty data list")
-                    return {"error": "empty_data", "raw": body}
-
-                result_json = data_list[0].get("resultJson", {})
-                if not result_json:
-                    logger.warning("No resultJson in first data item")
-                    return {"error": "no_resultJson", "raw": body}
-
-                # Extract province from paramJson (for province-based routing)
-                param_json = data_list[0].get("paramJson", {})
-                province = ""
-                if isinstance(param_json, dict):
-                    province = param_json.get("province", "")
-                elif isinstance(param_json, str):
-                    try:
-                        province = json.loads(param_json).get("province", "")
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                # Flatten resultJson: {tax_code: {code, data: {table: {field: val}}}}
-                # into {tax_code: {table.field: val}}
-                flattened = self._flatten_result_json(result_json)
-                return {
-                    "data": flattened,
-                    "raw_resultJson": result_json,
-                    "province": province,
-                    "paramJson": param_json,
-                }
+                parsed = self._parse_task_body(body)
+                if parsed.get("retryable") and attempt < retries:
+                    time.sleep(delay)
+                    continue
+                return parsed
 
             except requests.RequestException as e:
                 logger.error(f"API request failed (attempt {attempt}): {e}")
+                if self._should_try_curl_fallback(e):
+                    fallback = self._fetch_by_curl(url, timeout)
+                    if fallback is not None:
+                        return fallback
                 if attempt < retries:
                     time.sleep(delay)
                 else:
+                    fallback = self._fetch_by_curl(url, timeout)
+                    if fallback is not None:
+                        return fallback
                     return {"error": str(e)}
+
+    def _parse_task_body(self, body: dict[str, Any]) -> dict[str, Any]:
+        if not body.get("success"):
+            logger.warning(f"API returned unsuccessful response: {body.get('msg')}")
+            return {"error": body.get("msg", "Unknown error"), "raw": body, "retryable": True}
+
+        data_list = body.get("data", [])
+        if not data_list:
+            logger.warning("API returned empty data list")
+            return {"error": "empty_data", "raw": body}
+
+        result_json = data_list[0].get("resultJson", {})
+        if not result_json:
+            logger.warning("No resultJson in first data item")
+            return {"error": "no_resultJson", "raw": body}
+
+        # Extract province from paramJson (for province-based routing)
+        param_json = data_list[0].get("paramJson", {})
+        province = ""
+        if isinstance(param_json, dict):
+            province = param_json.get("province", "")
+        elif isinstance(param_json, str):
+            try:
+                province = json.loads(param_json).get("province", "")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Flatten resultJson: {tax_code: {code, data: {table: {field: val}}}}
+        # into {tax_code: {table.field: val}}
+        flattened = self._flatten_result_json(result_json)
+        return {
+            "data": flattened,
+            "raw_resultJson": result_json,
+            "province": province,
+            "paramJson": param_json,
+        }
+
+    def _fetch_by_curl(self, url: str, timeout: int) -> dict[str, Any] | None:
+        curl_path = shutil.which("curl.exe") or shutil.which("curl")
+        if not curl_path:
+            return None
+        try:
+            logger.warning("Requests failed; retrying task API with curl fallback")
+            completed = subprocess.run(
+                [
+                    curl_path,
+                    "-L",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    str(timeout),
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout + 5,
+                check=False,
+            )
+            if completed.returncode != 0:
+                logger.error("curl fallback failed: %s", completed.stderr.strip())
+                return None
+            return self._parse_task_body(json.loads(completed.stdout))
+        except Exception as exc:
+            logger.error("curl fallback raised error: %s", exc)
+            return None
+
+    @staticmethod
+    def _should_try_curl_fallback(exc: Exception) -> bool:
+        text = str(exc)
+        return "SSLEOFError" in text or "UNEXPECTED_EOF_WHILE_READING" in text
 
     def fetch(
         self,
