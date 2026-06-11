@@ -74,6 +74,10 @@ class YdzCollector:
         self._append_submit_warnings(submit_data, result)
         if self._has_social_insurance_message(result.warnings):
             self._record_social_insurance_warning(result)
+        if self._has_no_need_collect_message(result.warnings):
+            result.status = "NO_NEED_COLLECTED"
+            result.terminal = True
+            return result
         if self._has_period_window_block(result.warnings):
             result.manual_required = True
             result.errors.append("Collection submit was blocked by Yidaizhang period window.")
@@ -87,10 +91,52 @@ class YdzCollector:
 
     def find_account(self, tax_no: str, period: str) -> YdzAccount | None:
         data = self.api.get_batch_list(tax_no=tax_no, period=period, area_code=self.query_area_code)
-        rows = data.get("data") or []
-        if not rows:
-            return None
-        row = rows[0]
+        rows = self._extract_batch_rows(data)
+        if rows:
+            return self._account_from_row(rows[0], tax_no)
+        return self._find_account_from_customer_workbench(tax_no)
+
+    def list_accounts(
+        self,
+        period: str,
+        keyword: str = "",
+        area_code: str | None = None,
+        page_size: int = 50,
+        max_pages: int = 3,
+    ) -> list[YdzAccount]:
+        accounts: list[YdzAccount] = []
+        seen: set[str] = set()
+        page_size = max(1, int(page_size or 50))
+        max_pages = max(1, int(max_pages or 1))
+        query_area = area_code or self.query_area_code
+        for page_now in range(1, max_pages + 1):
+            data = self.api.get_batch_list(
+                tax_no=keyword,
+                period=period,
+                area_code=query_area,
+                page_now=page_now,
+                limit=page_size,
+            )
+            rows = self._extract_batch_rows(data)
+            if not rows:
+                break
+            for row in rows:
+                tax_no = str(
+                    row.get("taxNo")
+                    or row.get("taxCode")
+                    or row.get("custTaxNo")
+                    or row.get("taxNum")
+                    or ""
+                ).strip()
+                if not tax_no or tax_no in seen:
+                    continue
+                seen.add(tax_no)
+                accounts.append(self._account_from_row(row, tax_no))
+            if len(rows) < page_size:
+                break
+        return accounts
+
+    def _account_from_row(self, row: dict[str, Any], tax_no: str) -> YdzAccount:
         area_code = self._resolve_area_code(row, tax_no)
         return YdzAccount(
             tax_no=tax_no,
@@ -102,6 +148,69 @@ class YdzCollector:
             gather_status=row.get("gatherInitStatusEnum"),
             raw=row,
         )
+
+    def _find_account_from_customer_workbench(self, tax_no: str) -> YdzAccount | None:
+        query = getattr(self.api, "query_customer_workbench", None)
+        if not callable(query):
+            return None
+        try:
+            data = query(tax_no)
+        except Exception as exc:
+            LOGGER.info("Customer workbench fallback query failed for %s: %s", tax_no, exc)
+            return None
+        for row in self._extract_customer_workbench_rows(data):
+            row_tax_no = str(row.get("taxNo") or row.get("tenantTaxNo") or row.get("custTaxNo") or "").strip()
+            if row_tax_no != tax_no:
+                continue
+            return self._account_from_customer_workbench_row(row, tax_no)
+        return None
+
+    def _account_from_customer_workbench_row(self, row: dict[str, Any], tax_no: str) -> YdzAccount | None:
+        assoc_tenant_id = self._safe_int(row.get("assocTenantId") or row.get("tId") or row.get("thId"))
+        if not assoc_tenant_id:
+            return None
+        normalized = dict(row)
+        normalized.setdefault("source", "customer_workbench_fallback")
+        normalized.setdefault("gatherInitStatusEnum", "")
+        normalized.setdefault("authStatusEnum", row.get("authStatusEnum") or row.get("authStatus") or "AUTHORIZED")
+        return YdzAccount(
+            tax_no=tax_no,
+            cust_name=str(row.get("custName") or row.get("corpName") or row.get("name") or ""),
+            assoc_tenant_id=assoc_tenant_id,
+            account_id=self._safe_int(row.get("id") or row.get("custId") or row.get("easyacctgCustId")),
+            area_code=self._resolve_area_code(row, tax_no),
+            auth_status=str(normalized.get("authStatusEnum") or ""),
+            gather_status=str(normalized.get("gatherInitStatusEnum") or ""),
+            raw=normalized,
+        )
+
+    def _extract_customer_workbench_rows(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        payload = data.get("data") if isinstance(data, dict) else None
+        if isinstance(payload, dict):
+            for key in ("custList", "content", "records", "rows", "list"):
+                rows = payload.get(key)
+                if isinstance(rows, list):
+                    return [row for row in rows if isinstance(row, dict)]
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+        return []
+
+    def _safe_int(self, value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _extract_batch_rows(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        payload = data.get("data") or []
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+        if isinstance(payload, dict):
+            for key in ("content", "records", "rows", "list"):
+                rows = payload.get(key)
+                if isinstance(rows, list):
+                    return [row for row in rows if isinstance(row, dict)]
+        return []
 
     def poll_collect_status(self, result: YdzCollectResult) -> YdzCollectResult:
         deadline = time.time() + self.poll_timeout
@@ -162,6 +271,9 @@ class YdzCollector:
 
     def _has_social_insurance_message(self, values: list[str]) -> bool:
         return any("\u793e\u4f1a\u4fdd\u9669\u8d39" in str(value or "") for value in values)
+
+    def _has_no_need_collect_message(self, values: list[str]) -> bool:
+        return any("\u672c\u671f\u65e0\u9700\u7533\u62a5" in str(value or "") for value in values)
 
     def _record_social_insurance_warning(self, result: YdzCollectResult) -> None:
         for warning in result.warnings:

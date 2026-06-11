@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 ETAX_PLUGIN_PATH = Path(r"C:\Users\Administrator\Downloads\EtaxPlugin")
 DEFAULT_CDP_PORT = 9222
+CHROME_AUTOMATION_STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
 
 
 class BrowserManager:
@@ -86,12 +87,17 @@ class BrowserManager:
 
         cmd = [
             chrome_path,
-            f"--load-extension={plugin_path}",
             f"--user-data-dir={user_data_dir}",
             f"--remote-debugging-port={cdp_port}",
             "--no-first-run",
             "--no-default-browser-check",
+            *CHROME_AUTOMATION_STEALTH_ARGS,
         ]
+        plugin_disabled_values = {"", "none", "disabled", "false", "0"}
+        if str(plugin_path).strip().lower() not in plugin_disabled_values:
+            cmd.insert(1, f"--load-extension={plugin_path}")
+        else:
+            logger.info("Launching Chrome without EtaxPlugin extension")
 
         logger.info(f"Launching Chrome: {cmd}")
         self._chrome_process = subprocess.Popen(cmd)

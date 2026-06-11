@@ -6,7 +6,7 @@ from typing import Any
 
 
 TERMINAL_COLLECT_STATUSES = {"COLLECTED", "COLLECTED_PART", "COLLECTED_FAIL", "NO_NEED_COLLECTED"}
-DEFAULT_COLLECT_TAX_TYPE_IDS = [1, 3, 2, 26, 29, 31]
+DEFAULT_COLLECT_TAX_TYPE_IDS = [1, 3, 2, 26, 29, 30, 31]
 SOCIAL_INSURANCE_TAX_TYPE_IDS = {40}
 CBJ_COLLECT_TAX_TYPE_IDS = [26, 31]
 
@@ -50,10 +50,28 @@ class YdzCollectResult:
     tax_items: list[dict[str, Any]] = field(default_factory=list)
     ignored_tax_items: list[dict[str, Any]] = field(default_factory=list)
     verify_task_id: str | None = None
+    verify_task_ids: list[str] = field(default_factory=list)
     submitted_at: datetime | None = None
     resolved_task: dict[str, Any] | None = None
+    resolved_tasks: list[dict[str, Any]] = field(default_factory=list)
+
+    def task_ids(self) -> list[str]:
+        values: list[str] = []
+        if self.verify_task_id:
+            values.append(str(self.verify_task_id))
+        values.extend(str(item) for item in self.verify_task_ids if item)
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
 
     def to_dict(self) -> dict[str, Any]:
+        task_ids = self.task_ids()
+        resolved_tasks = self.resolved_tasks or ([self.resolved_task] if self.resolved_task else [])
         return {
             "taxNo": self.tax_no,
             "period": self.period,
@@ -64,7 +82,8 @@ class YdzCollectResult:
             "status": self.status,
             "warnings": self.warnings,
             "errors": self.errors,
-            "verifyTaskId": self.verify_task_id,
+            "verifyTaskId": task_ids[0] if task_ids else None,
+            "verifyTaskIds": task_ids,
             "account": None
             if self.account is None
             else {
@@ -79,5 +98,6 @@ class YdzCollectResult:
             "taxItems": self.tax_items,
             "ignoredTaxItems": self.ignored_tax_items,
             "submittedAt": self.submitted_at.isoformat(timespec="seconds") if self.submitted_at else None,
-            "resolvedTask": self.resolved_task,
+            "resolvedTask": resolved_tasks[0] if resolved_tasks else None,
+            "resolvedTasks": resolved_tasks,
         }

@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdp-port", type=int, default=9222)
     parser.add_argument("--browser-mode", choices=["auto", "connect", "launch"], default="auto", dest="mode_for_browser")
     parser.add_argument("--config-root", default="config")
+    parser.add_argument("--chrome-path", default=r"C:\Program Files\Google\Chrome\Application\chrome.exe")
     parser.add_argument("--user-data-dir", default="./browser_profile/etax_compare_forms")
     parser.add_argument("--plugin-path", default=r"C:\Users\Administrator\Downloads\EtaxPlugin")
     parser.add_argument("--chanjet-timeout", type=int, default=300)
@@ -40,6 +41,7 @@ def main() -> int:
         browser_args = argparse.Namespace(
             cdp_port=args.cdp_port,
             mode=args.mode_for_browser,
+            chrome_path=args.chrome_path,
             user_data_dir=args.user_data_dir,
             plugin_path=args.plugin_path,
             chanjet_timeout=args.chanjet_timeout,

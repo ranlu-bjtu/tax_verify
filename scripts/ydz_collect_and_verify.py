@@ -87,32 +87,34 @@ def main() -> int:
     for result in results:
         status = result.status or "UNKNOWN"
         print(f"{result.tax_no}: {status}, submitted={result.submitted}, manualRequired={result.manual_required}")
-        if result.verify_task_id:
-            print(f"  resolved collect taskId: {result.verify_task_id}")
+        task_ids = result.task_ids()
+        if task_ids:
+            print(f"  resolved collect taskId: {'、'.join(task_ids)}")
         for warning in result.warnings:
             print(f"  warning: {warning}")
         for error in result.errors:
             print(f"  error: {error}")
 
         if args.verify:
-            if result.verify_task_id:
-                cmd = [
-                    sys.executable,
-                    "main.py",
-                    "--task-id",
-                    result.verify_task_id,
-                    "--targets",
-                    args.targets,
-                    "--log-level",
-                    args.log_level,
-                    "--tax-timeout",
-                    str(args.tax_timeout),
-                ]
-                if args.skip_browser:
-                    cmd.append("--skip-browser")
-                cmd.extend(["--browser-lock-timeout", str(args.browser_lock_timeout)])
-                proc = subprocess.run(cmd)
-                exit_code = max(exit_code, proc.returncode)
+            if task_ids:
+                for task_id in task_ids:
+                    cmd = [
+                        sys.executable,
+                        "main.py",
+                        "--task-id",
+                        task_id,
+                        "--targets",
+                        args.targets,
+                        "--log-level",
+                        args.log_level,
+                        "--tax-timeout",
+                        str(args.tax_timeout),
+                    ]
+                    if args.skip_browser:
+                        cmd.append("--skip-browser")
+                    cmd.extend(["--browser-lock-timeout", str(args.browser_lock_timeout)])
+                    proc = subprocess.run(cmd)
+                    exit_code = max(exit_code, proc.returncode)
             else:
                 print(f"  verification skipped: no verification taskId resolved for {result.tax_no}")
                 exit_code = max(exit_code, 2)

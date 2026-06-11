@@ -128,6 +128,234 @@ def test_parse_appendix5_grid_rows_from_page_text():
     assert data["dqxztze"] == "0.00"
 
 
+def test_parse_appendix5_absent_not_applicable_zero_rows():
+    text = """
+增值税及附加税费申报表附列资料（五）
+税（费）种
+计税（费）依据
+城市维护建设税
+1
+37,703.27
+0.00
+0.00
+0.00
+7.000000%
+2,639.23
+请选择
+0.00
+0007049903|SXA031901267|小型微利企业城市维护建设税减征
+50.000000%
+1,319.62
+0.00
+0.00
+1,319.61
+教育费附加
+2
+37,703.27
+0.00
+0.00
+0.00
+3.000000%
+1,131.10
+请选择
+0.00
+0061049903|SXA031901273|小型微利企业教育费附加减征
+50.000000%
+565.55
+0.00
+0.00
+565.55
+"""
+    mappings = [
+        mapping("zzsxejmje_dfjyfj", 4),
+        mapping("bqyjse_dfjyfj", 15),
+        mapping("dqxztze", 15, line_no="5", row_name="当期新增投资额"),
+    ]
+
+    data = parse_vat_general_appendix5_text(text, mappings)
+
+    assert data["zzsxejmje_dfjyfj"] == "0.00"
+    assert data["bqyjse_dfjyfj"] == "0.00"
+    assert data["dqxztze"] == "0.00"
+
+
+def test_parse_appendix5_line_separated_rows_with_code_placeholders():
+    text = """
+增值税及附加税费申报表附列资料（五）
+税（费）种
+计税（费）依据
+城市维护建设税
+1
+37,703.27
+0.00
+0.00
+0.00
+7.000000%
+2,639.23
+请选择
+0.00
+0007049903|SXA031901267|小型微利企业城市维护建设税减征
+50.000000%
+1,319.62
+0.00
+0.00
+1,319.61
+教育费附加
+2
+37,703.27
+0.00
+0.00
+0.00
+3.000000%
+1,131.10
+请选择
+0.00
+0061049903|SXA031901273|小型微利企业教育费附加减征
+50.000000%
+565.55
+0.00
+0.00
+565.55
+"""
+    mappings = [
+        mapping("jsyjzzsybzzs_cjs", 3),
+        mapping("slzsl_cjs", 7),
+        mapping("bqynse_cjs", 8),
+        mapping("bqyjse_cjs", 15),
+        mapping("bqybtse_cjs", 16),
+        mapping("slzsl_jyfj", 7),
+        mapping("bqybtse_jyfj", 16),
+        mapping("bqybtse_dfjyfj", 16),
+    ]
+
+    data = parse_vat_general_appendix5_text(text, mappings)
+
+    assert data["jsyjzzsybzzs_cjs"] == "37,703.27"
+    assert data["slzsl_cjs"] == "7.000000%"
+    assert data["bqynse_cjs"] == "2,639.23"
+    assert data["bqyjse_cjs"] == "0.00"
+    assert data["bqybtse_cjs"] == "1,319.61"
+    assert data["slzsl_jyfj"] == "3.000000%"
+    assert data["bqybtse_jyfj"] == "565.55"
+    assert data["bqybtse_dfjyfj"] == "0.00"
+
+
+def test_parse_appendix5_sparse_zero_rows_default_paid_tax_to_zero():
+    text = """
+增值税及附加税费申报表附列资料（五）
+教育费附加
+2
+0.00
+0.00
+0.00
+0.00
+3.000000%
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+地方教育附加
+3
+0.00
+0.00
+0.00
+0.00
+2.000000%
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+当期新增投资额
+5
+0.00
+"""
+    mappings = [
+        mapping("bqyjse_jyfj", 15),
+        mapping("bqyjse_dfjyfj", 15),
+        mapping("dqxztze", 15, line_no="5", row_name="当期新增投资额"),
+    ]
+
+    data = parse_vat_general_appendix5_text(text, mappings)
+
+    assert data["bqyjse_jyfj"] == "0.00"
+    assert data["bqyjse_dfjyfj"] == "0.00"
+    assert data["dqxztze"] == "0.00"
+
+
+def test_parse_appendix5_multiline_exemption_text_keeps_paid_tax_column_aligned():
+    text = """
+增值税及附加税费申报表附列资料（五）
+教育费附加	4,300.18	0.00	0.00	0.00	0.03	129.01	0061042802
+|按月纳税
+的月销售额
+免征教育费
+附加|《财政部 国家税务总局通知》
+12号第一条	129.01	50.00	0.00	|	0.00	0.00	0.00
+地方教育附加	4,300.18	0.00	0.00	0.00	0.02	86.00	0099042802
+|除小规模
+纳税人外月
+免征地方教
+育附加|
+号第一条第（一）款	86.00	50.00	0.00	|	0.00	0.00	0.00
+合计	12,900.54	0.00	0.00	0.00	--	516.02	--	215.01	--	150.51	--	0.00	0.00	150.50
+"""
+    mappings = [
+        mapping("bqyjse_jyfj", 15),
+        mapping("bqybtse_jyfj", 16),
+        mapping("bqyjse_dfjyfj", 15),
+        mapping("bqybtse_dfjyfj", 16),
+    ]
+
+    data = parse_vat_general_appendix5_text(text, mappings)
+
+    assert data["bqyjse_jyfj"] == "0.00"
+    assert data["bqybtse_jyfj"] == "0.00"
+    assert data["bqyjse_dfjyfj"] == "0.00"
+    assert data["bqybtse_dfjyfj"] == "0.00"
+
+
+def test_parse_appendix5_present_label_without_value_is_not_synthesized():
+    text = """
+增值税及附加税费申报表附列资料（五）
+城市维护建设税
+1
+0.00
+0.00
+0.00
+0.00
+7.000000%
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+地方教育附加
+当期新增投资额
+"""
+    mappings = [
+        mapping("zzsxejmje_dfjyfj", 4),
+        mapping("dqxztze", 15, line_no="5", row_name="当期新增投资额"),
+    ]
+
+    data = parse_vat_general_appendix5_text(text, mappings)
+
+    assert data.get("zzsxejmje_dfjyfj") in (None, "")
+    assert data.get("dqxztze") in (None, "")
+
+
 if __name__ == "__main__":
     test_parse_appendix5_grid_rows_from_page_text()
+    test_parse_appendix5_absent_not_applicable_zero_rows()
+    test_parse_appendix5_line_separated_rows_with_code_placeholders()
+    test_parse_appendix5_sparse_zero_rows_default_paid_tax_to_zero()
+    test_parse_appendix5_multiline_exemption_text_keeps_paid_tax_column_aligned()
+    test_parse_appendix5_present_label_without_value_is_not_synthesized()
     print("All appendix5 extraction tests passed!")

@@ -29,6 +29,10 @@ class YdzApi:
         payload = self._batch_list_payload(tax_no, period, area_code, page_now, limit)
         return self._post_json("/trans/easyacctg/query/getBatchList", payload)
 
+    def query_customer_workbench(self, tax_no: str, page_no: int = 1, page_size: int = 20) -> dict[str, Any]:
+        payload = {"pageNo": page_no, "pageSize": page_size, "keyword": tax_no}
+        return self._post_json("/trans/easyacctg/custWorkbench/queryPageList", payload)
+
     def submit_collect_task(
         self,
         tax_no: str,
@@ -75,7 +79,16 @@ class YdzApi:
                 const prefix = location.pathname.split('/work.html')[0];
                 let ws = {};
                 try { ws = JSON.parse(localStorage.getItem('wsInfo') || '{}'); } catch (e) {}
-                const auth = sessionStorage.getItem('iframeToken') || localStorage.getItem('ciaToken') || '';
+                const iframeToken = sessionStorage.getItem('iframeToken') || '';
+                const ciaToken = localStorage.getItem('ciaToken') || '';
+                if (!iframeToken || !ciaToken) {
+                    return {
+                        clientError: 'Yidaizhang login token is missing',
+                        currentUrl: location.href,
+                        hasIframeToken: !!iframeToken,
+                        hasCiaToken: !!ciaToken
+                    };
+                }
                 const userId = ws.userId || ws.UserId || '60009603684';
                 const orgId = ws.orgId || ws.OrgId || '90011827608';
                 const reqId = 'ydz-codex-' + Date.now() + '-' + Math.random().toString(16).slice(2);
@@ -92,7 +105,8 @@ class YdzApi:
                         headers: {
                             'accept': 'application/json, text/plain, */*',
                             'content-type': 'application/json;charset=UTF-8',
-                            'authorization': auth
+                            'authorization': 'Bearer ' + iframeToken,
+                            'token': ciaToken
                         },
                         credentials: 'include',
                         body: JSON.stringify(payload),

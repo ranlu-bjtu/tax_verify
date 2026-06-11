@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import html
 import json
@@ -15,9 +16,10 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 sys.path.insert(0, ".")
 
@@ -27,20 +29,53 @@ from src.cbj.verification import (
     verify_annual_settlement_cbj,
     verify_personal_cbj,
 )
+from src.chanjet_admin.task_execution_log import fetch_cbj_mode_from_task_logs
 from src.chanjet_admin.task_query import TASK_LIST_URL, ChanjetAdminTaskQuery
 from src.coverage.analyzer import write_coverage_status
-from src.coverage.registry import build_coverage_targets, normalize_tax_type as normalize_coverage_tax_type
-from src.coverage.supplement import CoverageSupplementPlanner, apply_supplement_candidates_to_state
+from src.coverage.registry import (
+    build_coverage_targets,
+    declaration_statuses_for_collect_statuses,
+    normalize_collect_status_keys,
+    normalize_tax_type as normalize_coverage_tax_type,
+    normalize_tax_type_keys,
+)
+from src.coverage.models import SupplementCandidate
+from src.coverage.supplement import (
+    CoverageSupplementPlanner,
+    apply_supplement_candidates_to_state,
+    select_diverse_supplement_candidates,
+)
+from src.login.task_login_flow import DEFAULT_MACHINE_ID, GET_CLIENT_JOB_URL, GET_TASK_COOKIE_FALLBACK_URL, TaskLoginFlow
 from src.runtime.process_lock import DEFAULT_TAX_BROWSER_LOCK, ProcessLock
 from src.ydz.api import YdzApi
 from src.ydz.collector import YdzCollector
-from src.ydz.models import TERMINAL_COLLECT_STATUSES, YdzCollectResult
+from src.ydz.models import TERMINAL_COLLECT_STATUSES, YdzAccount, YdzCollectResult
 from src.ydz.session import YdzSession, get_env_credentials
 from src.ydz.task_resolver import VerifyTaskResolver
 
 
 LOGGER = logging.getLogger("batch_collect_verify")
 PROBLEM_STATUSES = {"mismatch", "api_missing", "web_missing", "parse_error", "mapping_error"}
+MAX_SUPPLEMENT_QUERY_WINDOW_DAYS = 39
+SUPPLEMENT_LOGIN_PREFLIGHT_POOL_MULTIPLIER = 3
+SUPPLEMENT_LOGIN_PREFLIGHT_REFILL_MAX_WAVES = 3
+STANDARD_SUPPLEMENT_LOGIN_PREFLIGHT_TAX_TYPES = {
+    "VAT_GENERAL",
+    "VAT_SMALL",
+    "CULTURE_FEE",
+    "CBJ_PERSONAL",
+    "CBJ_ANNUAL",
+}
+CIT_A_YDZ_TAX_TYPE_IDS = [2]
+CIT_A_YDZ_ACCOUNT_SCAN_PAGE_SIZE = 50
+CIT_A_YDZ_ACCOUNT_SCAN_MAX_PAGES = 3
+CIT_A_YDZ_ACCOUNT_SCAN_MAX_PERIODS = 1
+CIT_A_YDZ_REFRESH_POLL_TIMEOUT_SECONDS = 45
+YDZ_EXTERNAL_ACCOUNT_SCAN_SOURCES = {
+    "other_enterprise_account_scan",
+    "explicit_work_url_account_scan",
+    "open_work_tab_account_scan",
+}
 FORM_ORDER = [
     "vat_general_main",
     "vat_general_appendix1",
@@ -104,6 +139,30 @@ TAX_TYPE_LABELS = {
     "CBJ_PERSONAL": "个税残保金",
     "CBJ_ANNUAL": "汇算清缴残保金",
 }
+DECLARATION_STATUS_LABELS = {
+    "filed": "已申报",
+    "submitted": "已申报",
+    "success": "已申报",
+    "collected": "已申报",
+    "unfiled": "未申报",
+    "not_filed": "未申报",
+    "no_declaration": "未申报",
+    "no_need": "未申报",
+    "not_collected": "未申报",
+    "any": "不区分申报状态",
+    "unknown": "未知",
+    "": "未知",
+}
+COVERAGE_SUPPLEMENT_STATUS_LABELS = {
+    "not_run": "未执行",
+    "not_needed": "无需补齐",
+    "running": "查询中",
+    "failed": "查询失败",
+    "no_candidates": "未找到可补齐任务",
+    "applied": "已找到补齐任务",
+    "applying": "正在重试补齐任务",
+    "verified": "补齐任务已验证",
+}
 YDZ_TAX_TYPE_ID_LABELS = {
     1: "增值税",
     2: "企业所得税",
@@ -155,10 +214,10 @@ def previous_month_period(today: date | None = None) -> str:
 def parse_tax_nos(args: argparse.Namespace) -> list[str]:
     values: list[str] = []
     for item in args.tax_no or []:
-        values.extend(part.strip() for part in item.split(",") if part.strip())
+        values.extend(part.strip().lstrip("\ufeff") for part in item.split(",") if part.strip().lstrip("\ufeff"))
     if args.tax_no_file:
         for line in Path(args.tax_no_file).read_text(encoding="utf-8").splitlines():
-            clean = line.strip()
+            clean = line.strip().lstrip("\ufeff")
             if clean and not clean.startswith("#"):
                 values.append(clean)
     seen: set[str] = set()
@@ -173,6 +232,33 @@ def parse_tax_nos(args: argparse.Namespace) -> list[str]:
     if duplicates:
         LOGGER.warning("Duplicate tax numbers ignored: %s", ", ".join(unique_texts(duplicates)))
     return deduped
+
+
+def split_config_values(values: Any) -> list[str]:
+    if values is None:
+        return []
+    raw_items = values if isinstance(values, (list, tuple, set)) else [values]
+    result: list[str] = []
+    for raw_item in raw_items:
+        for part in re.split(r"[,\r\n]+", str(raw_item or "")):
+            clean = part.strip()
+            if clean:
+                result.append(clean)
+    return result
+
+
+def explicit_ydz_work_urls(args: argparse.Namespace) -> list[str]:
+    values = split_config_values(getattr(args, "coverage_supplement_ydz_work_url", []))
+    values.extend(split_config_values(os.environ.get("YDZ_SUPPLEMENT_WORK_URLS", "")))
+    return unique_texts(values)
+
+
+def redact_ydz_work_url_label(work_url: str) -> str:
+    parsed = urlparse(str(work_url or "").strip())
+    host = parsed.netloc or "ydz-work-url"
+    if "/work.html" in str(parsed.path or ""):
+        return f"{host}/.../work.html"
+    return host
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,6 +278,11 @@ def parse_args() -> argparse.Namespace:
         help="Skip verification when an existing summary report is already available for the same taskId.",
     )
     parser.add_argument("--force", action="store_true", help="Submit collection even if the account is already collected.")
+    parser.add_argument(
+        "--reuse-collected-task",
+        action="store_true",
+        help="Allow resolving an existing backend task when Yidaizhang already shows collected. By default, new batch runs submit a fresh collection task.",
+    )
     parser.add_argument("--targets", default="auto", help="Targets passed to main.py.")
     parser.add_argument("--skip-browser", action="store_true", help="Passed to main.py verification.")
     parser.add_argument("--skip-pdf", action="store_true", help="Passed to main.py verification.")
@@ -202,10 +293,94 @@ def parse_args() -> argparse.Namespace:
         help="Skip backend representative-task search for uncovered tax/status targets.",
     )
     parser.add_argument(
+        "--coverage-supplement-only",
+        action="store_true",
+        help="Only run backend coverage supplement for an existing run state; skip collection and existing-item verification.",
+    )
+    parser.add_argument(
         "--coverage-supplement-page-size",
         type=int,
-        default=50,
+        default=500,
         help="Page size used when searching backend supplement tasks.",
+    )
+    parser.add_argument(
+        "--coverage-supplement-timeout",
+        type=int,
+        default=600,
+        help="Maximum seconds for backend supplement search. 0 disables the limit.",
+    )
+    parser.add_argument(
+        "--coverage-supplement-lookback-days",
+        type=int,
+        default=0,
+        help="Backend supplement search lookback days. 0 keeps the current-month default.",
+    )
+    parser.add_argument(
+        "--coverage-supplement-cit-lookback-days",
+        type=int,
+        default=100,
+        help="Backend supplement lookback days for CIT A representative samples. Queries are sliced into backend-safe windows.",
+    )
+    parser.add_argument(
+        "--coverage-supplement-max-candidates",
+        type=int,
+        default=3,
+        help="Maximum backend supplement candidates to try for each missing coverage target.",
+    )
+    parser.add_argument(
+        "--coverage-supplement-targets",
+        default="",
+        help=(
+            "Comma-separated coverage target keys to supplement, for example "
+            "CIT_A:filed,CIT_A:unfiled. This does not change the batch coverage scope."
+        ),
+    )
+    parser.add_argument(
+        "--coverage-supplement-refresh-cit-from-ydz",
+        action="store_true",
+        help=(
+            "For CIT A supplement, first try to submit a fresh Yidaizhang collection. "
+            "Candidate tax numbers are checked first; if they are absent, a bounded scan of "
+            "current-enterprise account sets is used. Default is off."
+        ),
+    )
+    parser.add_argument(
+        "--coverage-supplement-scan-ydz-enterprises",
+        action="store_true",
+        help=(
+            "When CIT A fresh refresh finds no current-enterprise source, read-only scan other "
+            "selectable Yidaizhang enterprises for CIT A account rows. Default is off."
+        ),
+    )
+    parser.add_argument(
+        "--coverage-supplement-ydz-enterprise-scan-limit",
+        type=int,
+        default=8,
+        help="Maximum number of other Yidaizhang enterprises to scan for CIT A source readiness.",
+    )
+    parser.add_argument(
+        "--coverage-supplement-ydz-enterprise-names",
+        default="",
+        help="Optional comma-separated Yidaizhang enterprise names to scan before auto-detected names.",
+    )
+    parser.add_argument(
+        "--coverage-supplement-ydz-work-url",
+        action="append",
+        default=[],
+        help=(
+            "Explicit Yidaizhang cloud work.html URL to scan for CIT A source rows. "
+            "Can be repeated; YDZ_SUPPLEMENT_WORK_URLS is also read."
+        ),
+    )
+    parser.add_argument(
+        "--coverage-tax-types",
+        default="",
+        help="Comma-separated coverage tax type keys. Empty means all supported tax types.",
+    )
+    parser.add_argument(
+        "--coverage-collect-statuses",
+        default="",
+        help="Comma-separated coverage collect status keys: collected,not_collected. Empty means both.",
     )
     parser.add_argument(
         "--cbj-mode",
@@ -218,15 +393,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tax-login-strategy",
         choices=["direct_first", "plugin_first"],
-        default="direct_first",
-        help="Tax bureau login strategy passed to main.py. direct_first avoids the fixed plugin wait when task cookies are ready.",
+        default="plugin_first",
+        help="Tax bureau login strategy passed to main.py. plugin_first uses EtaxPlugin cleanup/new-tab flow before direct fallback.",
     )
     parser.add_argument("--cdp-port", type=int, default=9222)
+    parser.add_argument("--chrome-path", default=r"C:\Program Files\Google\Chrome\Application\chrome.exe")
     parser.add_argument("--user-data-dir", default="./browser_profile/etax_compare_forms")
     parser.add_argument("--plugin-path", default=r"C:\Users\Administrator\Downloads\EtaxPlugin")
     parser.add_argument("--poll-interval", type=int, default=15)
     parser.add_argument("--poll-timeout", type=int, default=600)
     parser.add_argument("--browser-lock-timeout", type=int, default=3600)
+    parser.add_argument(
+        "--verify-timeout",
+        type=int,
+        default=0,
+        help="Maximum seconds for each main.py verification subprocess. 0 uses a bounded default derived from --tax-timeout.",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -248,13 +430,18 @@ def main() -> int:
     write_state(state, run_dir)
 
     exit_code = 0
-    if not args.skip_collect:
+    if args.coverage_supplement_only:
+        if args.skip_coverage_supplement:
+            LOGGER.info("Coverage supplement only was requested, but coverage supplement is skipped.")
+        else:
+            exit_code = run_coverage_supplement_phase(args, state, run_dir)
+    elif not args.skip_collect:
         exit_code = run_collect_stream(args, tax_nos, state, run_dir)
     else:
         LOGGER.info("Skipping collection phase; using existing state: %s", run_dir / "state.json")
         if args.verify:
             exit_code = run_verify_phase(args, tax_nos, state, run_dir, final=True)
-    if args.verify and not args.skip_coverage_supplement:
+    if not args.coverage_supplement_only and args.verify and not args.skip_coverage_supplement:
         exit_code = max(exit_code, run_coverage_supplement_phase(args, state, run_dir))
     render_summary(state, run_dir)
     return exit_code
@@ -275,12 +462,157 @@ def load_or_create_state(args: argparse.Namespace, tax_nos: list[str], run_id: s
     state["updatedAt"] = datetime.now().isoformat(timespec="seconds")
     state["period"] = args.period
     state["enterprise"] = args.enterprise
+    selected_coverage_tax_types = parse_coverage_tax_types(getattr(args, "coverage_tax_types", ""))
+    if selected_coverage_tax_types:
+        state["coverageTaxTypes"] = selected_coverage_tax_types
+    else:
+        state.setdefault("coverageTaxTypes", [])
+    selected_collect_statuses = parse_coverage_collect_statuses(getattr(args, "coverage_collect_statuses", ""))
+    if selected_collect_statuses:
+        state["coverageCollectStatuses"] = selected_collect_statuses
+    else:
+        state.setdefault("coverageCollectStatuses", [])
     for tax_no in tax_nos:
         state.setdefault("items", {}).setdefault(
             tax_no,
             {"taxNo": tax_no, "period": args.period, "collect": None, "verify": None},
         )
     return state
+
+
+def parse_coverage_tax_types(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = [part.strip() for part in re.split(r"[,，;\s]+", value) if part.strip()]
+    else:
+        parts = [str(part).strip() for part in value if str(part).strip()]
+    return normalize_tax_type_keys(parts)
+
+
+def parse_coverage_collect_statuses(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = [part.strip() for part in re.split(r"[,，;\s]+", value) if part.strip()]
+    else:
+        parts = [str(part).strip() for part in value if str(part).strip()]
+    return normalize_collect_status_keys(parts)
+
+
+def parse_coverage_supplement_target_keys(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = [part.strip() for part in re.split(r"[,，\s]+", value) if part.strip()]
+    else:
+        parts = [str(part).strip() for part in value if str(part).strip()]
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        key = normalize_coverage_supplement_target_key(part)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(key)
+    return result
+
+
+def normalize_coverage_supplement_target_key(value: Any) -> str:
+    text = str(value or "").strip().replace("：", ":")
+    if ":" not in text:
+        return ""
+    tax_type_raw, status_raw = text.split(":", 1)
+    tax_types = normalize_tax_type_keys([tax_type_raw])
+    status = normalize_coverage_supplement_target_status(status_raw)
+    if not tax_types or not status:
+        return ""
+    return f"{tax_types[0]}:{status}"
+
+
+def normalize_coverage_supplement_target_status(value: Any) -> str:
+    raw = str(value or "").strip()
+    upper = raw.upper()
+    aliases = {
+        "FILED": "filed",
+        "COLLECTED": "filed",
+        "SUCCESS": "filed",
+        "\u5df2\u53d6\u6570": "filed",
+        "\u5df2\u7533\u62a5": "filed",
+        "UNFILED": "unfiled",
+        "NOT_COLLECTED": "unfiled",
+        "NOT-COLLECTED": "unfiled",
+        "NO_NEED": "unfiled",
+        "\u672a\u53d6\u6570": "unfiled",
+        "\u672a\u7533\u62a5": "unfiled",
+        "ANY": "any",
+        "ALL": "any",
+    }
+    return aliases.get(upper) or aliases.get(raw) or ""
+
+
+def coverage_targets_for_state(state: dict[str, Any]) -> list[Any]:
+    return build_coverage_targets(
+        declaration_statuses=declaration_statuses_for_collect_statuses(state.get("coverageCollectStatuses") or []),
+        tax_types=parse_coverage_tax_types(state.get("coverageTaxTypes") or []),
+    )
+
+
+def coverage_supplement_target_form_ids(
+    item: dict[str, Any],
+    active_target_key: str = "",
+) -> list[str]:
+    if str(item.get("source") or "") != "backend_supplement":
+        return []
+    keys: list[str] = []
+    if active_target_key:
+        keys.append(active_target_key)
+    if not keys:
+        keys.extend(str(value or "") for value in item.get("coverageSupplementTargets") or [])
+    if not keys:
+        resolved = (item.get("collect") or {}).get("resolvedTask") or {}
+        if resolved.get("coverageTarget"):
+            keys.append(str(resolved.get("coverageTarget") or ""))
+
+    targets_by_key = {target.key: target for target in build_coverage_targets()}
+    form_ids: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        target = targets_by_key.get(str(key or ""))
+        if not target:
+            continue
+        for form_id in target.form_ids:
+            # CBJ supplement is verified by the dedicated CBJ path, not main.py targets.
+            if str(form_id).startswith("cbj_"):
+                continue
+            if form_id in seen:
+                continue
+            seen.add(form_id)
+            form_ids.append(form_id)
+    return form_ids
+
+
+def verify_targets_for_item(
+    requested_targets: str,
+    item: dict[str, Any],
+    active_coverage_target_key: str = "",
+) -> str:
+    if str(requested_targets or "").strip().lower() != "auto":
+        return requested_targets
+    form_ids = coverage_supplement_target_form_ids(item, active_coverage_target_key)
+    if not form_ids:
+        return requested_targets
+    return ",".join(form_ids)
+
+
+def declaration_status_override_for_coverage_target(active_coverage_target_key: str) -> str:
+    key = str(active_coverage_target_key or "").strip()
+    if ":" not in key:
+        return ""
+    status = normalize_coverage_supplement_target_status(key.split(":", 1)[1])
+    if status in {"filed", "unfiled"}:
+        return status
+    return ""
 
 
 def write_state(state: dict[str, Any], run_dir: Path) -> None:
@@ -336,7 +668,14 @@ def set_item_stage(
         item["stageStatus"] = status
     if reason:
         item["stageReason"] = reason
-    if previous != stage or message or reason:
+    event_status = status or stage_status_for_item(item)
+    event_key = {
+        "stage": stage,
+        "status": event_status,
+        "message": message,
+        "reason": reason,
+    }
+    if previous != stage or event_key != item.get("_lastOpsEventKey"):
         append_ops_event(
             run_dir,
             {
@@ -345,11 +684,12 @@ def set_item_stage(
                 "taxNo": tax_no,
                 "stage": stage,
                 "stageName": OPS_STAGE_LABELS.get(stage, stage),
-                "status": status or stage_status_for_item(item),
+                "status": event_status,
                 "message": message,
                 "reason": reason,
             },
         )
+        item["_lastOpsEventKey"] = event_key
 
 
 def append_ops_event(run_dir: Path, event: dict[str, Any]) -> None:
@@ -376,10 +716,12 @@ def build_ops_status(state: dict[str, Any]) -> dict[str, Any]:
         area_code = str(account.get("areaCode") or "")[:2]
         stage = str(item.get("stage") or "queued")
         status = stage_status_for_item(item)
+        stage_reason = str(item.get("stageReason") or "")
         reason = (
-            item.get("stageReason")
-            or handling.get("manualReason")
+            handling.get("manualReason")
             or direct_verify_reason(verify)
+            or direct_verify_reason({"reason": stage_reason})
+            or stage_reason
             or direct_collect_failure_reason("; ".join(str(x) for x in collect.get("errors") or []))
         )
         action = handling.get("manualAction") or suggested_stage_action(stage, reason)
@@ -394,7 +736,7 @@ def build_ops_status(state: dict[str, Any]) -> dict[str, Any]:
                 "stageName": OPS_STAGE_LABELS.get(stage, stage),
                 "status": status,
                 "statusLabel": ops_status_label(status),
-                "taskId": collect.get("verifyTaskId") or "",
+                "taskId": format_task_ids(collect_task_ids(collect)),
                 "collectStatus": collect.get("status") or "",
                 "verifyStatus": verify.get("status") or "",
                 "manualCategory": handling.get("manualCategory") or "",
@@ -418,6 +760,8 @@ def stage_status_for_item(item: dict[str, Any]) -> str:
     collect = item.get("collect") or {}
     verify = item.get("verify") or {}
     stage = str(item.get("stage") or "")
+    if str(collect.get("status") or "").upper() == "NO_NEED_COLLECTED" or stage == "collect_no_need":
+        return "success"
     if bool(collect.get("manualRequired")) or stage in {"collect_session_failed", "collect_failed", "collect_timeout", "task_unresolved"}:
         return "manual"
     verify_status = str(verify.get("status") or "")
@@ -429,7 +773,7 @@ def stage_status_for_item(item: dict[str, Any]) -> str:
         return "failed"
     if verify_status == "skipped":
         return "skipped"
-    if stage in {"verified", "collect_no_need"}:
+    if stage in {"verified"}:
         return "success"
     if stage:
         return "running"
@@ -464,6 +808,24 @@ def overall_ops_status(items: list[dict[str, Any]]) -> str:
 
 def direct_verify_reason(verify: dict[str, Any]) -> str:
     reason = str(verify.get("reason") or "")
+    if "TaxLoginNotReadyError" in reason or "Tax bureau login state or digital account authentication is not ready" in reason:
+        return normalize_supplement_failure_reason(reason)
+    if "PendingTaxLoginJobError" in reason or "已有进税局任务未完成" in reason:
+        return normalize_supplement_failure_reason(reason)
+    if "ForceTaxLoginRequiredError" in reason or "needForceTax" in reason:
+        return normalize_supplement_failure_reason(reason)
+    if "getClientJob" in reason:
+        return normalize_supplement_failure_reason(reason)
+    if "Cannot resolve province from task cookie/client job data" in reason:
+        return normalize_supplement_failure_reason(reason)
+    if "getTaskCookie failed" in reason:
+        return normalize_supplement_failure_reason(reason)
+    if "Could not navigate to declaration query page" in reason:
+        return normalize_supplement_failure_reason(reason)
+    if "RuntimeError:" in reason or "TimeoutError:" in reason:
+        return normalize_supplement_failure_reason(reason)
+    if "DeclarationQueryAuthError" in reason or "统一登录页" in reason or "数字账户认证" in reason:
+        return "税局登录态或数字账户认证已失效。"
     if "Annual CIT A100000 declaration query returned no row" in reason:
         return "\u672a\u67e5\u5230 A100000 \u5e74\u62a5\u7533\u62a5\u8bb0\u5f55\uff0c\u9700\u6838\u5bf9\u7533\u62a5\u8868\u79cd\u7c7b\u3001\u7533\u62a5\u65e5\u671f\u548c\u7a0e\u6b3e\u6240\u5c5e\u671f\u6761\u4ef6\u3002"
     if "Tax bureau login timeout" in reason:
@@ -476,6 +838,12 @@ def direct_verify_reason(verify: dict[str, Any]) -> str:
 
 
 def suggested_stage_action(stage: str, reason: str) -> str:
+    if "未能进入申报信息查询页" in reason:
+        return "人工重新进入对应税局/数字账户后点击继续验证。"
+    if "税局登录失败" in reason or "税局登录超时" in reason or "登录连接状态已失效" in reason:
+        return "重新进入税局或重新发起取数任务后再验证。"
+    if "统一登录页" in reason or "数字账户认证" in reason:
+        return "人工重新进入对应税局/数字账户后点击继续验证。"
     if "税局" in reason or "数字账户" in reason:
         return "完成税局登录后点击继续验证。"
     if stage == "task_unresolved":
@@ -510,6 +878,11 @@ def friendly_collect_exception(exc: Exception) -> str:
             "\u6613\u4ee3\u8d26\u767b\u5f55\u6001\u7f3a\u5931\uff0c\u4e14\u672a\u8bbe\u7f6e "
             "YDZ_USERNAME/YDZ_PASSWORD\u3002\u8bf7\u5148\u767b\u5f55\u6216\u5728\u5f53\u524d\u7ec8\u7aef\u8bbe\u7f6e\u51ed\u636e\u540e\u91cd\u8bd5\u3002"
         )
+    if is_ydz_invalid_signature_error(exc):
+        return (
+            "\u6613\u4ee3\u8d26\u767b\u5f55\u7b7e\u540d\u5df2\u5931\u6548\uff0c"
+            "\u9700\u8981\u91cd\u65b0\u767b\u5f55\u6613\u4ee3\u8d26\u540e\u518d\u53d1\u8d77\u53d6\u6570\u3002"
+        )
     if (
         "api context is not ready" in lower_text
         or "did not reach the batch declaration page" in lower_text
@@ -534,6 +907,13 @@ def friendly_collect_exception(exc: Exception) -> str:
     return text or str(type(exc).__name__)
 
 
+def is_ydz_invalid_signature_error(exc: Exception | str) -> bool:
+    lower_text = str(exc or "").lower()
+    return "invalid signature" in lower_text and (
+        "easyacctg" in lower_text or "getbatchlist" in lower_text or "batchsubmittask" in lower_text
+    )
+
+
 def run_collect_phase(args: argparse.Namespace, tax_nos: list[str], state: dict[str, Any], run_dir: Path) -> None:
     username, password = get_env_credentials()
     submitted_results: dict[str, YdzCollectResult] = {}
@@ -545,6 +925,7 @@ def run_collect_phase(args: argparse.Namespace, tax_nos: list[str], state: dict[
     ):
         session = YdzSession(
             cdp_port=args.cdp_port,
+            chrome_path=args.chrome_path,
             user_data_dir=args.user_data_dir,
             plugin_path=args.plugin_path,
             launch_if_needed=True,
@@ -564,11 +945,13 @@ def run_collect_phase(args: argparse.Namespace, tax_nos: list[str], state: dict[
             for tax_no in tax_nos:
                 item = state["items"][tax_no]
                 collect = item.get("collect") or {}
-                if collect.get("verifyTaskId") and not args.force:
-                    LOGGER.info("Skipping collection for %s; taskId already resolved: %s", tax_no, collect["verifyTaskId"])
+                force_collect = should_force_collect(args, collect)
+                existing_task_ids = collect_task_ids(collect)
+                if existing_task_ids and not force_collect:
+                    LOGGER.info("Skipping collection for %s; taskId already resolved: %s", tax_no, format_task_ids(existing_task_ids))
                     continue
                 LOGGER.info("Submitting Yidaizhang collection for %s/%s", tax_no, args.period)
-                result = collector.submit_collect_tax_no(tax_no=tax_no, period=args.period, force=args.force)
+                result = collector.submit_collect_tax_no(tax_no=tax_no, period=args.period, force=force_collect)
                 submitted_results[tax_no] = result
                 item["collect"] = result.to_dict()
                 set_item_stage(
@@ -602,7 +985,7 @@ def run_collect_stream(args: argparse.Namespace, tax_nos: list[str], state: dict
             for tax_no in tax_nos:
                 item = state["items"][tax_no]
                 collect = item.get("collect") or {}
-                if collect.get("verifyTaskId") and not args.force:
+                if collect_task_ids(collect) and not should_force_collect(args, collect):
                     continue
                 result = collect_failure_result(tax_no, args.period, args.enterprise, RuntimeError(preflight_error))
                 item["collect"] = result.to_dict()
@@ -628,6 +1011,8 @@ def run_collect_stream(args: argparse.Namespace, tax_nos: list[str], state: dict
         if not pending:
             break
         if time.time() >= deadline:
+            resolve_pending_after_collect_timeout(args, pending, state, run_dir)
+            pending = pending_collect_results(results)
             for tax_no, result in pending.items():
                 result.manual_required = True
                 result.errors.append(f"Timed out waiting for collection terminal status; last status={result.status}.")
@@ -643,6 +1028,50 @@ def run_collect_stream(args: argparse.Namespace, tax_nos: list[str], state: dict
     if any(result.manual_required for result in results.values()):
         exit_code = max(exit_code, 2)
     return exit_code
+
+
+def resolve_pending_after_collect_timeout(
+    args: argparse.Namespace,
+    pending: dict[str, YdzCollectResult],
+    state: dict[str, Any],
+    run_dir: Path,
+) -> None:
+    if not pending:
+        return
+    LOGGER.info(
+        "Collection polling timed out; checking backend for %s pending task(s) before manual fallback.",
+        len(pending),
+    )
+    try:
+        with open_ydz_session(
+            args,
+            {"kind": "batch-ydz-timeout-resolve", "runId": state["runId"], "period": args.period},
+        ) as (
+            _session,
+            resolver,
+            _collector,
+        ):
+            for tax_no, result in pending.items():
+                if has_result_task_id(result):
+                    continue
+                before = result_task_ids(result)
+                resolve_task_id_for_result(resolver, tax_no, result, state, run_dir)
+                resolved_ids = result_task_ids(result)
+                if resolved_ids and resolved_ids != before:
+                    result.manual_required = False
+                    result.terminal = True
+                    state["items"][tax_no]["collect"] = result.to_dict()
+                    set_item_stage(
+                        state,
+                        run_dir,
+                        tax_no,
+                        "task_resolved",
+                        status="running",
+                        message=f"超时前后台兜底解析到 taskId：{format_task_ids(resolved_ids)}",
+                    )
+    except Exception as exc:
+        LOGGER.warning("Backend timeout fallback could not run: %s", exc)
+    write_state(state, run_dir)
 
 
 def preflight_error_reason(args: argparse.Namespace) -> str:
@@ -694,6 +1123,71 @@ def is_proxy_like_network_error(text: str) -> bool:
     )
 
 
+def collect_task_ids(collect: dict[str, Any] | None) -> list[str]:
+    collect = collect or {}
+    status_by_task_id: dict[str, str] = {}
+    resolved_tasks = list(collect.get("resolvedTasks") or [])
+    if collect.get("resolvedTask"):
+        resolved_tasks.append(collect.get("resolvedTask") or {})
+    for task in resolved_tasks:
+        task_id = str((task or {}).get("taskId") or "").strip()
+        status = str((task or {}).get("status") or "").upper()
+        if task_id and status:
+            status_by_task_id[task_id] = status
+    values: list[Any] = []
+    values.extend(collect.get("verifyTaskIds") or [])
+    for key in ("verifyTaskId", "taskId"):
+        value = collect.get(key)
+        if value:
+            values.insert(0, value)
+    resolved = collect.get("resolvedTask") or {}
+    if resolved.get("taskId"):
+        values.append(resolved.get("taskId"))
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        known_status = status_by_task_id.get(text)
+        if known_status and known_status not in {"SUCCESS", "SUCCEEDED"}:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def result_task_ids(result: YdzCollectResult) -> list[str]:
+    return result.task_ids()
+
+
+def has_result_task_id(result: YdzCollectResult) -> bool:
+    return bool(result_task_ids(result))
+
+
+def format_task_ids(task_ids: list[str]) -> str:
+    return "、".join(task_ids)
+
+
+def should_force_collect(args: argparse.Namespace, collect: dict[str, Any] | None = None) -> bool:
+    collect = collect or {}
+    if bool(getattr(args, "force", False)):
+        return True
+    if bool(getattr(args, "reuse_collected_task", False)):
+        return False
+    return not bool(collect_task_ids(collect))
+
+
+def verification_subprocess_timeout(args: argparse.Namespace) -> int:
+    explicit = int(getattr(args, "verify_timeout", 0) or 0)
+    if explicit > 0:
+        return explicit
+    if bool(getattr(args, "skip_browser", False)):
+        return 120
+    tax_timeout = int(getattr(args, "tax_timeout", 600) or 600)
+    return max(300, min(900, tax_timeout + 180))
+
+
 def submit_collect_batch(
     args: argparse.Namespace,
     tax_nos: list[str],
@@ -703,19 +1197,38 @@ def submit_collect_batch(
     submitted_results: dict[str, YdzCollectResult] = {}
     try:
         with open_ydz_session(args, {"kind": "batch-ydz-submit", "runId": state["runId"], "period": args.period}) as (
-            _session,
+            session,
             _resolver,
             collector,
         ):
+            retried_invalid_signature = False
             for tax_no in tax_nos:
                 item = state["items"][tax_no]
                 collect = item.get("collect") or {}
-                if collect.get("verifyTaskId") and not args.force:
-                    LOGGER.info("Skipping collection for %s; taskId already resolved: %s", tax_no, collect["verifyTaskId"])
+                force_collect = should_force_collect(args, collect)
+                existing_task_ids = collect_task_ids(collect)
+                if existing_task_ids and not force_collect:
+                    LOGGER.info("Skipping collection for %s; taskId already resolved: %s", tax_no, format_task_ids(existing_task_ids))
                     continue
                 LOGGER.info("Submitting Yidaizhang collection for %s/%s", tax_no, args.period)
                 try:
-                    result = collector.submit_collect_tax_no(tax_no=tax_no, period=args.period, force=args.force)
+                    try:
+                        result = collector.submit_collect_tax_no(tax_no=tax_no, period=args.period, force=force_collect)
+                    except Exception as exc:
+                        if not is_ydz_invalid_signature_error(exc) or retried_invalid_signature:
+                            raise
+                        LOGGER.warning(
+                            "Yidaizhang login signature is invalid; refreshing login state and retrying once."
+                        )
+                        username, password = get_env_credentials()
+                        page = session.refresh_login_state(
+                            username=username,
+                            password=password,
+                            enterprise=args.enterprise,
+                        )
+                        collector.api = YdzApi(page)
+                        retried_invalid_signature = True
+                        result = collector.submit_collect_tax_no(tax_no=tax_no, period=args.period, force=force_collect)
                     set_item_stage(
                         state,
                         run_dir,
@@ -739,7 +1252,7 @@ def submit_collect_batch(
         for tax_no in tax_nos:
             item = state["items"][tax_no]
             collect = item.get("collect") or {}
-            if collect.get("verifyTaskId") and not args.force:
+            if collect_task_ids(collect) and not should_force_collect(args, collect):
                 continue
             result = collect_failure_result(tax_no, args.period, args.enterprise, exc)
             submitted_results[tax_no] = result
@@ -768,6 +1281,7 @@ class open_ydz_session:
         try:
             self.session = YdzSession(
                 cdp_port=self.args.cdp_port,
+                chrome_path=self.args.chrome_path,
                 user_data_dir=self.args.user_data_dir,
                 plugin_path=self.args.plugin_path,
                 launch_if_needed=True,
@@ -818,7 +1332,7 @@ def poll_and_resolve_once(
                 result = results.get(tax_no)
                 if result is None:
                     continue
-                if result.verify_task_id:
+                if has_result_task_id(result):
                     continue
                 if result.submitted and not result.terminal and not result.manual_required:
                     try:
@@ -838,15 +1352,18 @@ def poll_and_resolve_once(
                         )
                         last_status[tax_no] = result.status
                     state["items"][tax_no]["collect"] = result.to_dict()
-                    set_item_stage(state, run_dir, tax_no, "collect_poll_retry", status="running", message=f"当前取数状态：{result.status}")
                 if is_result_ready_for_task_resolution(result):
-                    before = result.verify_task_id
+                    before = result_task_ids(result)
                     resolve_task_id_for_result(resolver, tax_no, result, state, run_dir)
-                    did_resolve = did_resolve or bool(result.verify_task_id and result.verify_task_id != before)
+                    did_resolve = did_resolve or bool(result_task_ids(result) and result_task_ids(result) != before)
                 elif str(result.status or "").upper() == "NO_NEED_COLLECTED":
+                    result.terminal = True
+                    state["items"][tax_no]["collect"] = result.to_dict()
                     set_item_stage(state, run_dir, tax_no, "collect_no_need", status="success", message="本期无需取数。")
                 elif result.terminal:
                     set_item_stage(state, run_dir, tax_no, "collect_terminal", status="running", message=f"取数终态：{result.status}")
+                elif result.submitted and not result.manual_required:
+                    set_item_stage(state, run_dir, tax_no, "collect_poll_retry", status="running", message=f"当前取数状态：{result.status}")
             write_state(state, run_dir)
     except Exception as exc:
         LOGGER.warning("Could not open Yidaizhang session while polling; will retry until timeout: %s", exc)
@@ -862,13 +1379,13 @@ def pending_collect_results(results: dict[str, YdzCollectResult]) -> dict[str, Y
     return {
         tax_no: result
         for tax_no, result in results.items()
-        if result.submitted and not result.terminal and not result.manual_required
+        if not has_result_task_id(result) and result.submitted and not result.terminal and not result.manual_required
     }
 
 
 def has_collect_poll_work(results: dict[str, YdzCollectResult]) -> bool:
     for result in results.values():
-        if result.verify_task_id:
+        if has_result_task_id(result):
             continue
         if result.submitted and not result.terminal and not result.manual_required:
             return True
@@ -897,14 +1414,111 @@ def has_verifiable_items(
     verified_task_ids: set[str] | None = None,
 ) -> bool:
     verified_task_ids = verified_task_ids or set()
-    for tax_no in tax_nos:
-        item = state["items"].get(tax_no) or {}
-        collect = item.get("collect") or {}
-        verify = item.get("verify") or {}
-        task_id = str(collect.get("verifyTaskId") or "")
-        if task_id and task_id not in verified_task_ids and (rerun_verified or not verify.get("status")):
-            return True
+    for item_key in verification_item_keys(tax_nos, state):
+        item = state["items"].get(item_key) or {}
+        task_ids = item_verification_task_ids(item)
+        for task_id in task_ids:
+            if task_id in verified_task_ids:
+                continue
+            if rerun_verified or not task_verify_status(item, task_id):
+                return True
     return False
+
+
+def verification_item_keys(tax_nos: list[str], state: dict[str, Any]) -> list[str]:
+    items = state.get("items") or {}
+    result: list[str] = []
+    seen: set[str] = set()
+
+    def add(key: str) -> None:
+        if key in items and key not in seen:
+            seen.add(key)
+            result.append(key)
+
+    for tax_no in tax_nos:
+        add(tax_no)
+        parent = items.get(tax_no) or {}
+        for key in parent.get("multiTaskItemKeys") or []:
+            add(str(key))
+        prefix = f"{tax_no}__task__"
+        for key, item in items.items():
+            if key in seen:
+                continue
+            if item.get("parentTaxNo") == tax_no or key.startswith(prefix):
+                add(key)
+    return result
+
+
+def task_verify_status(item: dict[str, Any], task_id: str) -> str:
+    task_verify = task_verify_entry(item, task_id)
+    if task_verify:
+        return str(task_verify.get("status") or "")
+    verify = item.get("verify") or {}
+    task_ids = collect_task_ids(item.get("collect") or {})
+    if len(task_ids) <= 1:
+        return str(verify.get("status") or "")
+    return ""
+
+
+def item_verification_task_ids(item: dict[str, Any]) -> list[str]:
+    collect = item.get("collect") or {}
+    task_ids = collect_task_ids(collect)
+    if item.get("multiTaskItemKeys") and collect.get("verifyTaskId"):
+        return [str(collect.get("verifyTaskId"))]
+    return task_ids
+
+
+def task_verify_entry(item: dict[str, Any], task_id: str) -> dict[str, Any]:
+    verify_tasks = item.get("verifyTasks") or {}
+    if isinstance(verify_tasks, dict):
+        entry = verify_tasks.get(str(task_id)) or {}
+        return entry if isinstance(entry, dict) else {}
+    if isinstance(verify_tasks, list):
+        for entry in verify_tasks:
+            if isinstance(entry, dict) and str(entry.get("taskId") or "") == str(task_id):
+                return entry
+    return {}
+
+
+def set_task_verify_entry(item: dict[str, Any], task_id: str, verify: dict[str, Any]) -> None:
+    verify_tasks = item.setdefault("verifyTasks", {})
+    if not isinstance(verify_tasks, dict):
+        verify_tasks = {}
+        item["verifyTasks"] = verify_tasks
+    verify_tasks[str(task_id)] = {**verify, "taskId": str(task_id)}
+
+
+def aggregate_verify_status(task_results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not task_results:
+        return {}
+    return_code = max(int(result.get("returnCode") or 0) for result in task_results)
+    statuses = [str(result.get("status") or "") for result in task_results]
+    if any(status == "failed" for status in statuses):
+        status = "failed"
+    elif any(status == "completed_with_differences" for status in statuses):
+        status = "completed_with_differences"
+    elif any(status == "skipped" for status in statuses):
+        status = "skipped"
+    elif all(status == "success" for status in statuses):
+        status = "success"
+    else:
+        status = statuses[-1] or "unknown"
+    reasons = unique_texts([str(result.get("reason") or "") for result in task_results if result.get("reason")])
+    report_paths: list[str] = []
+    for result in task_results:
+        report_paths.extend(str(path) for path in result.get("reportPaths") or [] if path)
+    latest = task_results[-1]
+    return {
+        "status": status,
+        "returnCode": return_code,
+        "reason": "；".join(reasons[:3]),
+        "reportDir": latest.get("reportDir") or "",
+        "summaryPath": latest.get("summaryPath") or "",
+        "reportPaths": unique_texts(report_paths),
+        "stdoutLog": latest.get("stdoutLog") or "",
+        "stderrLog": latest.get("stderrLog") or "",
+        "updatedAt": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 def stream_collect_and_resolve_tasks(
@@ -919,7 +1533,7 @@ def stream_collect_and_resolve_tasks(
     pending = {
         tax_no: result
         for tax_no, result in results.items()
-        if result.submitted and not result.terminal and not result.manual_required
+        if not has_result_task_id(result) and result.submitted and not result.terminal and not result.manual_required
     }
     ready = {
         tax_no: result
@@ -956,6 +1570,13 @@ def stream_collect_and_resolve_tasks(
         if pending:
             time.sleep(poll_interval)
 
+    for tax_no, result in list(pending.items()):
+        resolve_task_id_for_result(resolver, tax_no, result, state, run_dir)
+        if has_result_task_id(result):
+            result.manual_required = False
+            result.terminal = True
+            state["items"][tax_no]["collect"] = result.to_dict()
+            pending.pop(tax_no, None)
     for tax_no, result in pending.items():
         result.manual_required = True
         result.errors.append(f"Timed out waiting for collection terminal status; last status={result.status}.")
@@ -966,13 +1587,90 @@ def stream_collect_and_resolve_tasks(
 
 
 def is_result_ready_for_task_resolution(result: YdzCollectResult) -> bool:
-    if result.verify_task_id:
+    if has_result_task_id(result):
         return False
     if str(result.status or "").upper() == "NO_NEED_COLLECTED":
         return False
     if result.manual_required and not result.submitted:
         return False
     return bool(result.terminal or result.status in TERMINAL_COLLECT_STATUSES)
+
+
+def resolved_task_payload(task: Any) -> dict[str, Any]:
+    return {
+        "taskId": task.task_id,
+        "taskTypeId": task.task_type_id,
+        "taskTypeName": task.task_type_name,
+        "status": task.status,
+        "period": task.period,
+        "createdStamp": task.created_stamp,
+    }
+
+
+def apply_resolved_tasks_to_result(resolver: VerifyTaskResolver, result: YdzCollectResult) -> None:
+    result.verify_task_ids = [task.task_id for task in resolver.last_tasks]
+    result.verify_task_id = result.verify_task_ids[0] if result.verify_task_ids else None
+    result.resolved_tasks = [resolved_task_payload(task) for task in resolver.last_tasks]
+    result.resolved_task = result.resolved_tasks[0] if result.resolved_tasks else None
+
+
+def sync_multi_task_items(state: dict[str, Any], parent_key: str, result: YdzCollectResult) -> None:
+    task_ids = result_task_ids(result)
+    items = state.setdefault("items", {})
+    parent_item = items.setdefault(
+        parent_key,
+        {"taxNo": result.tax_no, "period": result.period, "collect": None, "verify": None},
+    )
+    old_keys = [str(key) for key in parent_item.get("multiTaskItemKeys") or []]
+    new_keys: list[str] = []
+    if len(task_ids) <= 1:
+        for key in old_keys:
+            if (items.get(key) or {}).get("source") == "ydz_multi_task":
+                items.pop(key, None)
+        parent_item["multiTaskItemKeys"] = []
+        return
+
+    resolved_by_id = {
+        str(task.get("taskId") or ""): task
+        for task in result.resolved_tasks
+        if str(task.get("taskId") or "")
+    }
+    base_collect = result.to_dict()
+    for task_id in task_ids[1:]:
+        key = multi_task_item_key(parent_key, task_id)
+        new_keys.append(key)
+        collect = copy.deepcopy(base_collect)
+        resolved_task = resolved_by_id.get(task_id) or {"taskId": task_id}
+        collect["verifyTaskId"] = task_id
+        collect["verifyTaskIds"] = [task_id]
+        collect["resolvedTask"] = resolved_task
+        collect["resolvedTasks"] = [resolved_task]
+        item = items.setdefault(
+            key,
+            {
+                "taxNo": result.tax_no,
+                "period": result.period,
+                "collect": None,
+                "verify": None,
+            },
+        )
+        item["taxNo"] = result.tax_no
+        item["period"] = result.period
+        item["collect"] = collect
+        item["source"] = "ydz_multi_task"
+        item["parentTaxNo"] = parent_key
+        item["parentTaskIds"] = task_ids
+        item.setdefault("verify", None)
+
+    for key in old_keys:
+        if key not in new_keys and (items.get(key) or {}).get("source") == "ydz_multi_task":
+            items.pop(key, None)
+    parent_item["multiTaskItemKeys"] = new_keys
+
+
+def multi_task_item_key(parent_key: str, task_id: str) -> str:
+    safe_task_id = "".join(ch if ch.isalnum() else "_" for ch in str(task_id)).strip("_") or "task"
+    return f"{parent_key}__task__{safe_task_id}"
 
 
 def resolve_task_id_for_result(
@@ -982,31 +1680,25 @@ def resolve_task_id_for_result(
     state: dict[str, Any],
     run_dir: Path,
 ) -> None:
-    if result.verify_task_id:
+    if has_result_task_id(result):
         return
     try:
-        result.verify_task_id = resolver.resolve(result.tax_no, result.period, submitted_at=result.submitted_at)
-        if resolver.last_task:
-            result.resolved_task = {
-                "taskId": resolver.last_task.task_id,
-                "taskTypeId": resolver.last_task.task_type_id,
-                "taskTypeName": resolver.last_task.task_type_name,
-                "status": resolver.last_task.status,
-                "period": resolver.last_task.period,
-                "createdStamp": resolver.last_task.created_stamp,
-            }
+        resolver.resolve_all(result.tax_no, result.period, submitted_at=result.submitted_at)
+        apply_resolved_tasks_to_result(resolver, result)
     except Exception as exc:
         LOGGER.warning("Could not resolve collect taskId for %s/%s: %s", result.tax_no, result.period, exc)
         result.warnings.append(f"Could not resolve collect taskId: {exc}")
     state["items"][tax_no]["collect"] = result.to_dict()
+    sync_multi_task_items(state, tax_no, result)
+    resolved_ids = result_task_ids(result)
     set_item_stage(
         state,
         run_dir,
         tax_no,
-        "task_resolved" if result.verify_task_id else "task_unresolved",
-        status="running" if result.verify_task_id else "manual",
-        message=f"已解析 taskId：{result.verify_task_id}" if result.verify_task_id else "",
-        reason="" if result.verify_task_id else "后台未解析到取数 taskId。",
+        "task_resolved" if resolved_ids else "task_unresolved",
+        status="running" if resolved_ids else "manual",
+        message=f"已解析 taskId：{format_task_ids(resolved_ids)}" if resolved_ids else "",
+        reason="" if resolved_ids else "后台未解析到取数 taskId。",
     )
     write_state(state, run_dir)
 
@@ -1018,31 +1710,25 @@ def resolve_task_ids(
     run_dir: Path,
 ) -> None:
     for tax_no, result in results.items():
-        if result.verify_task_id:
+        if has_result_task_id(result):
             continue
         try:
-            result.verify_task_id = resolver.resolve(result.tax_no, result.period, submitted_at=result.submitted_at)
-            if resolver.last_task:
-                result.resolved_task = {
-                    "taskId": resolver.last_task.task_id,
-                    "taskTypeId": resolver.last_task.task_type_id,
-                    "taskTypeName": resolver.last_task.task_type_name,
-                    "status": resolver.last_task.status,
-                    "period": resolver.last_task.period,
-                    "createdStamp": resolver.last_task.created_stamp,
-                }
+            resolver.resolve_all(result.tax_no, result.period, submitted_at=result.submitted_at)
+            apply_resolved_tasks_to_result(resolver, result)
         except Exception as exc:
             LOGGER.warning("Could not resolve collect taskId for %s/%s: %s", result.tax_no, result.period, exc)
             result.warnings.append(f"Could not resolve collect taskId: {exc}")
         state["items"][tax_no]["collect"] = result.to_dict()
+        sync_multi_task_items(state, tax_no, result)
+        resolved_ids = result_task_ids(result)
         set_item_stage(
             state,
             run_dir,
             tax_no,
-            "task_resolved" if result.verify_task_id else "task_unresolved",
-            status="running" if result.verify_task_id else "manual",
-            message=f"已解析 taskId：{result.verify_task_id}" if result.verify_task_id else "",
-            reason="" if result.verify_task_id else "后台未解析到取数 taskId。",
+            "task_resolved" if resolved_ids else "task_unresolved",
+            status="running" if resolved_ids else "manual",
+            message=f"已解析 taskId：{format_task_ids(resolved_ids)}" if resolved_ids else "",
+            reason="" if resolved_ids else "后台未解析到取数 taskId。",
         )
         write_state(state, run_dir)
 
@@ -1053,203 +1739,400 @@ def run_verify_phase(
     state: dict[str, Any],
     run_dir: Path,
     final: bool = False,
+    active_coverage_target_key: str = "",
 ) -> int:
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     exit_code = 0
 
-    for tax_no in tax_nos:
-        item = state["items"][tax_no]
+    for item_key in verification_item_keys(tax_nos, state):
+        item = state["items"][item_key]
         collect = item.get("collect") or {}
-        task_id = collect.get("verifyTaskId")
-        if not task_id:
+        task_ids = item_verification_task_ids(item)
+        display_tax_no = str(item.get("taxNo") or item_key)
+        if not task_ids:
             if not final:
                 continue
             no_need_collect = str(collect.get("status") or "").upper() == "NO_NEED_COLLECTED"
+            reason = no_task_skip_reason(item)
             item["verify"] = {
                 "status": "skipped",
-                "reason": no_task_skip_reason(item),
+                "reason": reason,
                 "updatedAt": datetime.now().isoformat(timespec="seconds"),
             }
             if no_need_collect:
-                set_item_stage(state, run_dir, tax_no, "collect_no_need", status="success", message="本期无需取数。")
+                set_item_stage(state, run_dir, item_key, "collect_no_need", status="success", message="本期无需取数。")
+            else:
+                set_item_stage(state, run_dir, item_key, "task_unresolved", status="manual", reason=reason)
             write_state(state, run_dir)
             if not no_need_collect:
                 exit_code = max(exit_code, 2)
             continue
 
-        existing_verify = item.get("verify") or {}
-        if str(task_id) in verified_task_ids_this_run(args):
-            LOGGER.info("Skipping verification for %s taskId=%s; already verified in this batch run", tax_no, task_id)
-            duplicate_reason = "同一批次已验证相同 taskId，已跳过重复执行。"
-            if not existing_verify.get("status"):
-                item["verify"] = {
+        task_results: list[dict[str, Any]] = []
+        for task_id in task_ids:
+            task_verify = task_verify_entry(item, task_id)
+            aggregate_verify = item.get("verify") or {}
+            if str(task_id) in verified_task_ids_this_run(args):
+                LOGGER.info("Skipping verification for %s taskId=%s; already verified in this batch run", display_tax_no, task_id)
+                duplicate_reason = "同一批次已验证相同 taskId，已跳过重复执行。"
+                if not task_verify and not aggregate_verify.get("status"):
+                    verify_record = {
+                        "status": "skipped",
+                        "returnCode": 0,
+                        "reason": duplicate_reason,
+                        "reportDir": str(Path("output") / "reports" / task_id),
+                        "summaryPath": "",
+                        "reportPaths": [],
+                        "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    set_task_verify_entry(item, task_id, verify_record)
+                    item["verify"] = aggregate_verify_status(list((item.get("verifyTasks") or {}).values()))
+                    set_item_stage(state, run_dir, item_key, "verified", status="skipped", reason=duplicate_reason)
+                    write_state(state, run_dir)
+                continue
+            if task_verify.get("status") and not args.rerun_verified:
+                LOGGER.info("Skipping verification for %s taskId=%s; already recorded status=%s", display_tax_no, task_id, task_verify["status"])
+                task_results.append(task_verify)
+                continue
+            if aggregate_verify.get("status") and len(task_ids) == 1 and not args.rerun_verified:
+                LOGGER.info("Skipping verification for %s; already recorded status=%s", display_tax_no, aggregate_verify["status"])
+                task_results.append(aggregate_verify)
+                continue
+
+            if bool(collect.get("manualRequired")):
+                reason = collect_failure_reason(collect) or "Collection requires manual handling; verification was skipped."
+                verify_record = {
                     "status": "skipped",
-                    "returnCode": 0,
-                    "reason": duplicate_reason,
+                    "returnCode": 2,
+                    "reason": reason,
                     "reportDir": str(Path("output") / "reports" / task_id),
                     "summaryPath": "",
+                    "reportPaths": [],
                     "updatedAt": datetime.now().isoformat(timespec="seconds"),
                 }
+                set_task_verify_entry(item, task_id, verify_record)
+                item["verify"] = aggregate_verify_status(list((item.get("verifyTasks") or {}).values()))
+                set_item_stage(state, run_dir, item_key, "skipped", status="manual", reason=reason)
+                write_state(state, run_dir)
+                exit_code = max(exit_code, 2)
+                task_results.append(verify_record)
+                continue
+
+            LOGGER.info("Running verification for %s taskId=%s", display_tax_no, task_id)
+            set_item_stage(state, run_dir, item_key, "verifying", status="running", message=f"开始验证 taskId={task_id}")
+            write_state(state, run_dir)
+            stdout_path = logs_dir / f"{item_key}_{task_id}.out.log"
+            stderr_path = logs_dir / f"{item_key}_{task_id}.err.log"
+            cbj_kind = ""
+            if item_requests_cbj_verification(item):
+                cbj_kind = detect_cbj_task(task_id) or "cbj"
+            report_dir = Path("output") / "reports" / task_id
+            reused_result = reuse_existing_verify_result(args, task_id, cbj_kind)
+            if reused_result:
+                verify_record = {
+                    **reused_result,
+                    "reportDir": str(report_dir),
+                    "reportPaths": reused_result.get("reportPaths") or [],
+                    "stdoutLog": str(stdout_path),
+                    "stderrLog": str(stderr_path),
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+                set_task_verify_entry(item, task_id, verify_record)
+                task_results.append(verify_record)
+                item["verify"] = aggregate_verify_status(list((item.get("verifyTasks") or {}).values()))
                 set_item_stage(
                     state,
                     run_dir,
-                    tax_no,
+                    item_key,
                     "verified",
-                    status="skipped",
-                    reason=duplicate_reason,
+                    status="success" if reused_result["returnCode"] == 0 else "warning",
+                    message="Reused existing verification report.",
                 )
                 write_state(state, run_dir)
-            continue
-        if existing_verify.get("status") and not args.rerun_verified:
-            LOGGER.info("Skipping verification for %s; already recorded status=%s", tax_no, existing_verify["status"])
-            continue
+                exit_code = max(exit_code, reused_result["returnCode"])
+                mark_task_id_verified_this_run(args, str(task_id))
+                continue
+            if cbj_kind:
+                cbj_mode = resolve_cbj_mode(args.cbj_mode, item, task_id=task_id)
+                LOGGER.info("Detected CBJ task for %s taskId=%s; mode=%s resolvedMode=%s", display_tax_no, task_id, args.cbj_mode, cbj_mode)
+                verify_result = run_cbj_verify(args, task_id, stdout_path, stderr_path, cbj_mode)
+                verify_record = {
+                    "status": verify_result["status"],
+                    "returnCode": verify_result["returnCode"],
+                    "mode": verify_result["mode"],
+                    "reason": verify_result.get("reason", ""),
+                    "reportDir": str(Path("output") / "reports" / task_id),
+                    "summaryPath": verify_result.get("summaryPath", ""),
+                    "reportPath": verify_result.get("reportPath", ""),
+                    "reportPaths": [verify_result.get("reportPath", "")] if verify_result.get("reportPath") else [],
+                    "stdoutLog": str(stdout_path),
+                    "stderrLog": str(stderr_path),
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+                set_task_verify_entry(item, task_id, verify_record)
+                task_results.append(verify_record)
+                item["verify"] = aggregate_verify_status(list((item.get("verifyTasks") or {}).values()))
+                set_item_stage(
+                    state,
+                    run_dir,
+                    item_key,
+                    "verified",
+                    status="success" if verify_result["returnCode"] == 0 else "warning",
+                    message="残保金验证完成。",
+                )
+                write_state(state, run_dir)
+                exit_code = max(exit_code, verify_result["returnCode"])
+                mark_task_id_verified_this_run(args, str(task_id))
+                continue
 
-        if bool(collect.get("manualRequired")):
-            reason = collect_failure_reason(collect) or "Collection requires manual handling; verification was skipped."
-            item["verify"] = {
-                "status": "skipped",
-                "returnCode": 2,
+            verify_targets = verify_targets_for_item(args.targets, item, active_coverage_target_key)
+            if verify_targets != args.targets:
+                LOGGER.info(
+                    "Restricting backend supplement verification for %s taskId=%s target=%s to forms=%s",
+                    display_tax_no,
+                    task_id,
+                    active_coverage_target_key or ",".join(item.get("coverageSupplementTargets") or []),
+                    verify_targets,
+                )
+
+            cmd = [
+                sys.executable,
+                "main.py",
+                "--task-id",
+                task_id,
+                "--targets",
+                verify_targets,
+                "--cdp-port",
+                str(args.cdp_port),
+                "--chrome-path",
+                args.chrome_path,
+                "--user-data-dir",
+                args.user_data_dir,
+                "--plugin-path",
+                args.plugin_path,
+                "--log-level",
+                args.log_level,
+                "--tax-timeout",
+                str(args.tax_timeout),
+                "--tax-login-strategy",
+                args.tax_login_strategy,
+                "--browser-lock-timeout",
+                str(args.browser_lock_timeout),
+            ]
+            if args.skip_browser:
+                cmd.append("--skip-browser")
+            if args.skip_pdf:
+                cmd.append("--skip-pdf")
+            declaration_status_override = declaration_status_override_for_coverage_target(active_coverage_target_key)
+            if declaration_status_override:
+                cmd.extend(["--declaration-status-override", declaration_status_override])
+
+            verify_start_ts = time.time()
+            verify_timeout = verification_subprocess_timeout(args)
+            timeout_reason = ""
+            with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        stdout=stdout,
+                        stderr=stderr,
+                        timeout=verify_timeout if verify_timeout > 0 else None,
+                    )
+                except subprocess.TimeoutExpired:
+                    timeout_reason = (
+                        f"Verification subprocess timed out after {verify_timeout}s; "
+                        f"taskId={task_id}, forms={verify_targets}."
+                    )
+                    LOGGER.warning("%s", timeout_reason)
+                    stderr.write(f"\nTimeoutError: {timeout_reason}\n")
+
+                    class TimedOutProcess:
+                        returncode = 124
+
+                    proc = TimedOutProcess()
+
+            report_since_ts = max(0, verify_start_ts - 2)
+            current_reports = load_compare_reports(task_id, since_ts=report_since_ts)
+            current_report_paths = [
+                str(report.get("_sourcePath"))
+                for report in current_reports
+                if report.get("_sourcePath")
+            ]
+            summary_path = latest_summary_path(report_dir, since_ts=report_since_ts)
+            if summary_path:
+                status = "success" if proc.returncode == 0 else "completed_with_differences"
+                return_code = proc.returncode
+                stage_status = "success" if proc.returncode == 0 else "warning"
+                reason = "" if proc.returncode == 0 else compare_report_reason(task_id, reports=current_reports) or tail_error_reason(stderr_path)
+            elif proc.returncode == 0:
+                status = "skipped"
+                return_code = 2
+                stage_status = "manual"
+                reason = no_targets_verify_reason(stdout_path, stderr_path)
+            else:
+                reason = timeout_reason or tail_error_reason(stderr_path) or tail_error_reason(stdout_path)
+                if is_no_targets_verify_reason(reason):
+                    status = "skipped"
+                    stage_status = "manual"
+                else:
+                    status = "failed"
+                    stage_status = "failed"
+                return_code = proc.returncode
+            verify_record = {
+                "status": status,
+                "returnCode": return_code,
                 "reason": reason,
-                "reportDir": str(Path("output") / "reports" / task_id),
-                "summaryPath": "",
-                "updatedAt": datetime.now().isoformat(timespec="seconds"),
-            }
-            set_item_stage(state, run_dir, tax_no, "skipped", status="manual", reason=reason)
-            write_state(state, run_dir)
-            exit_code = max(exit_code, 2)
-            continue
-
-        LOGGER.info("Running verification for %s taskId=%s", tax_no, task_id)
-        set_item_stage(state, run_dir, tax_no, "verifying", status="running", message=f"开始验证 taskId={task_id}")
-        write_state(state, run_dir)
-        stdout_path = logs_dir / f"{tax_no}_{task_id}.out.log"
-        stderr_path = logs_dir / f"{tax_no}_{task_id}.err.log"
-        cbj_kind = ""
-        if item_requests_cbj_verification(item):
-            cbj_kind = detect_cbj_task(task_id) or "cbj"
-        report_dir = Path("output") / "reports" / task_id
-        reused_result = reuse_existing_verify_result(args, task_id, cbj_kind)
-        if reused_result:
-            item["verify"] = {
-                **reused_result,
                 "reportDir": str(report_dir),
+                "summaryPath": str(summary_path) if summary_path else "",
+                "reportPaths": current_report_paths,
                 "stdoutLog": str(stdout_path),
                 "stderrLog": str(stderr_path),
                 "updatedAt": datetime.now().isoformat(timespec="seconds"),
             }
+            set_task_verify_entry(item, task_id, verify_record)
+            task_results.append(verify_record)
+            item["verify"] = aggregate_verify_status(list((item.get("verifyTasks") or {}).values()))
             set_item_stage(
                 state,
                 run_dir,
-                tax_no,
+                item_key,
                 "verified",
-                status="success" if reused_result["returnCode"] == 0 else "warning",
-                message="Reused existing verification report.",
+                status=stage_status,
+                message="验证完成。",
+                reason=reason,
             )
             write_state(state, run_dir)
-            exit_code = max(exit_code, reused_result["returnCode"])
+            exit_code = max(exit_code, return_code)
             mark_task_id_verified_this_run(args, str(task_id))
-            continue
-        if cbj_kind:
-            cbj_mode = resolve_cbj_mode(args.cbj_mode, item)
-            LOGGER.info("Detected CBJ task for %s taskId=%s; mode=%s resolvedMode=%s", tax_no, task_id, args.cbj_mode, cbj_mode)
-            verify_result = run_cbj_verify(args, task_id, stdout_path, stderr_path, cbj_mode)
-            item["verify"] = {
-                "status": verify_result["status"],
-                "returnCode": verify_result["returnCode"],
-                "mode": verify_result["mode"],
-                "reason": verify_result.get("reason", ""),
-                "reportDir": str(Path("output") / "reports" / task_id),
-                "summaryPath": verify_result.get("summaryPath", ""),
-                "reportPath": verify_result.get("reportPath", ""),
-                "stdoutLog": str(stdout_path),
-                "stderrLog": str(stderr_path),
-                "updatedAt": datetime.now().isoformat(timespec="seconds"),
-            }
-            set_item_stage(state, run_dir, tax_no, "verified", status="success" if verify_result["returnCode"] == 0 else "warning", message="残保金验证完成。")
+
+        if task_results:
+            item["verify"] = aggregate_verify_status(task_results)
+            if final and str(item.get("stage") or "") not in {"verified", "collect_no_need"}:
+                set_item_stage(
+                    state,
+                    run_dir,
+                    item_key,
+                    "verified",
+                    status=stage_status_for_item(item),
+                    reason=str((item.get("verify") or {}).get("reason") or ""),
+                )
             write_state(state, run_dir)
-            exit_code = max(exit_code, verify_result["returnCode"])
-            mark_task_id_verified_this_run(args, str(task_id))
-            continue
-
-        cmd = [
-            sys.executable,
-            "main.py",
-            "--task-id",
-            task_id,
-            "--targets",
-            args.targets,
-            "--cdp-port",
-            str(args.cdp_port),
-            "--user-data-dir",
-            args.user_data_dir,
-            "--plugin-path",
-            args.plugin_path,
-            "--log-level",
-            args.log_level,
-            "--tax-timeout",
-            str(args.tax_timeout),
-            "--tax-login-strategy",
-            args.tax_login_strategy,
-            "--browser-lock-timeout",
-            str(args.browser_lock_timeout),
-        ]
-        if args.skip_browser:
-            cmd.append("--skip-browser")
-        if args.skip_pdf:
-            cmd.append("--skip-pdf")
-
-        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
-            proc = subprocess.run(cmd, stdout=stdout, stderr=stderr)
-
-        summary_path = latest_summary_path(report_dir)
-        if summary_path:
-            status = "success" if proc.returncode == 0 else "completed_with_differences"
-            return_code = proc.returncode
-            stage_status = "success" if proc.returncode == 0 else "warning"
-            reason = "" if proc.returncode == 0 else compare_report_reason(task_id) or tail_error_reason(stderr_path)
-        elif proc.returncode == 0:
-            status = "skipped"
-            return_code = 2
-            stage_status = "manual"
-            reason = no_targets_verify_reason(stdout_path, stderr_path)
-        else:
-            reason = tail_error_reason(stderr_path) or tail_error_reason(stdout_path)
-            if is_no_targets_verify_reason(reason):
-                status = "skipped"
-                stage_status = "manual"
-            else:
-                status = "failed"
-                stage_status = "failed"
-            return_code = proc.returncode
-        item["verify"] = {
-            "status": status,
-            "returnCode": return_code,
-            "reason": reason,
-            "reportDir": str(report_dir),
-            "summaryPath": str(summary_path) if summary_path else "",
-            "stdoutLog": str(stdout_path),
-            "stderrLog": str(stderr_path),
-            "updatedAt": datetime.now().isoformat(timespec="seconds"),
-        }
-        set_item_stage(
-            state,
-            run_dir,
-            tax_no,
-            "verified",
-            status=stage_status,
-            message="验证完成。",
-            reason=reason,
-        )
-        write_state(state, run_dir)
-        exit_code = max(exit_code, return_code)
-        mark_task_id_verified_this_run(args, str(task_id))
 
     return exit_code
 
 
+def verify_supplement_target_candidates(
+    *,
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    run_dir: Path,
+    coverage_targets: list[Any],
+    target: Any,
+    target_candidates: list[Any],
+    attempts: list[dict[str, Any]],
+    applied_keys: list[str],
+    covered_keys: list[str],
+    verify_exit: int,
+) -> int:
+    target_key = str(getattr(target, "key", "") or "")
+    if not target_key or target_key in {str(key) for key in covered_keys}:
+        return verify_exit
+    if not target_candidates:
+        return verify_exit
+
+    for index, candidate in enumerate(target_candidates, start=1):
+        current_applied_keys = apply_supplement_candidates_to_state(state, [candidate], enterprise=args.enterprise)
+        if not current_applied_keys:
+            attempts.append(
+                build_supplement_attempt_record(
+                    candidate,
+                    target,
+                    index,
+                    len(target_candidates),
+                    item_key="",
+                    status="failed",
+                    step="write supplement task",
+                    reason="Backend supplement candidate could not be written into batch state.",
+                )
+            )
+            state["coverageSupplement"]["attempts"] = attempts
+            write_state(state, run_dir)
+            continue
+
+        item_key = current_applied_keys[0]
+        append_unique(applied_keys, item_key)
+        item = state["items"].get(item_key) or {}
+        task_id = ((item.get("collect") or {}).get("verifyTaskId")) or ""
+        attempt = build_supplement_attempt_record(
+            candidate,
+            target,
+            index,
+            len(target_candidates),
+            item_key=item_key,
+            status="verifying",
+            step="verify task",
+            reason="",
+        )
+        attempts.append(attempt)
+        state["coverageSupplement"]["appliedItemKeys"] = applied_keys
+        state["coverageSupplement"]["attempts"] = attempts
+        set_item_stage(
+            state,
+            run_dir,
+            item_key,
+            "task_resolved",
+            status="running",
+            message=(
+                f"coverage supplement candidate {index}/{len(target_candidates)} taskId={task_id}"
+                if task_id
+                else "coverage supplement candidate is waiting for verification task."
+            ),
+        )
+        write_state(state, run_dir)
+
+        verify_exit = max(
+            verify_exit,
+            run_verify_phase(
+                args,
+                [item_key],
+                state,
+                run_dir,
+                final=True,
+                active_coverage_target_key=target_key,
+            ),
+        )
+        coverage_after = write_coverage_status(run_dir, targets=coverage_targets)
+        item_after = state.get("items", {}).get(item_key) or {}
+        matrix_covered = coverage_target_is_covered(coverage_after, target_key)
+        covered = matrix_covered and supplement_item_has_clean_verification(item_after, task_id)
+        update_supplement_attempt_record(
+            attempt,
+            item_after,
+            covered,
+            task_id=task_id,
+            matrix_covered=matrix_covered,
+        )
+        state["coverageSupplement"]["attempts"] = attempts
+        if covered:
+            append_unique(covered_keys, target_key)
+            state["coverageSupplement"]["coveredKeys"] = covered_keys
+            write_state(state, run_dir)
+            break
+        write_state(state, run_dir)
+
+    return verify_exit
+
+
 def run_coverage_supplement_phase(args: argparse.Namespace, state: dict[str, Any], run_dir: Path) -> int:
-    coverage = write_coverage_status(run_dir)
+    previous_supplement = state.get("coverageSupplement") if isinstance(state.get("coverageSupplement"), dict) else {}
+    excluded_task_ids_by_target = merge_excluded_task_id_maps(
+        supplement_excluded_task_ids_from_attempts((previous_supplement or {}).get("attempts") or []),
+        supplement_excluded_task_ids_from_state(state),
+    )
+    excluded_candidate_count = sum(len(task_ids) for task_ids in excluded_task_ids_by_target.values())
+    coverage_targets = coverage_targets_for_state(state)
+    coverage = write_coverage_status(run_dir, targets=coverage_targets)
     missing_rows = coverage.get("missingTargets") or []
     if not missing_rows:
         state["coverageSupplement"] = {
@@ -1260,9 +2143,34 @@ def run_coverage_supplement_phase(args: argparse.Namespace, state: dict[str, Any
         write_state(state, run_dir)
         return 0
 
-    targets_by_key = {target.key: target for target in build_coverage_targets()}
+    targets_by_key = {target.key: target for target in coverage_targets}
     missing_keys = {str(row.get("key") or "") for row in missing_rows}
     missing_targets = [target for key, target in targets_by_key.items() if key in missing_keys]
+    raw_requested_targets = str(getattr(args, "coverage_supplement_targets", "") or "").strip()
+    requested_target_keys = parse_coverage_supplement_target_keys(raw_requested_targets)
+    if raw_requested_targets and not requested_target_keys:
+        state["coverageSupplement"] = {
+            "status": "failed",
+            "message": "No valid --coverage-supplement-targets were provided.",
+            "missingKeys": sorted(missing_keys),
+            "requestedTargetKeys": [],
+            "updatedAt": datetime.now().isoformat(timespec="seconds"),
+        }
+        write_state(state, run_dir)
+        return 2
+    if requested_target_keys:
+        requested_key_set = set(requested_target_keys)
+        missing_targets = [target for target in missing_targets if target.key in requested_key_set]
+        if not missing_targets:
+            state["coverageSupplement"] = {
+                "status": "not_needed",
+                "message": "Requested supplement targets are already covered or outside the current coverage scope.",
+                "missingKeys": sorted(missing_keys),
+                "requestedTargetKeys": requested_target_keys,
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+            write_state(state, run_dir)
+            return 0
     if not missing_targets:
         state["coverageSupplement"] = {
             "status": "failed",
@@ -1273,8 +2181,19 @@ def run_coverage_supplement_phase(args: argparse.Namespace, state: dict[str, Any
         write_state(state, run_dir)
         return 2
 
-    start_time = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     end_time = datetime.now()
+    lookback_days = max(0, int(getattr(args, "coverage_supplement_lookback_days", 0) or 0))
+    cit_lookback_days = max(0, int(getattr(args, "coverage_supplement_cit_lookback_days", 100) or 0))
+    configured_max_candidates = max(1, int(getattr(args, "coverage_supplement_max_candidates", 3) or 3))
+    max_candidates = effective_supplement_max_candidates(configured_max_candidates, missing_targets)
+    login_preflight_enabled = should_preflight_standard_supplement_candidates(missing_targets)
+    candidate_pool_limit = (
+        max_candidates * SUPPLEMENT_LOGIN_PREFLIGHT_POOL_MULTIPLIER
+        if login_preflight_enabled
+        else max_candidates
+    )
+    search_windows = supplement_time_windows(end_time, lookback_days)
+    start_time = min((window[0] for window in search_windows), default=end_time)
     LOGGER.info(
         "Searching backend supplement tasks for %s missing coverage target(s): %s",
         len(missing_targets),
@@ -1286,9 +2205,67 @@ def run_coverage_supplement_phase(args: argparse.Namespace, state: dict[str, Any
         "missingKeys": [target.key for target in missing_targets],
         "startTime": start_time.isoformat(timespec="seconds"),
         "endTime": end_time.isoformat(timespec="seconds"),
+        "lookbackDays": lookback_days,
+        "citLookbackDays": cit_lookback_days,
+        "maxCandidatesPerTarget": max_candidates,
+        "candidatePoolLimitPerTarget": candidate_pool_limit,
+        "loginPreflightEnabled": login_preflight_enabled,
+        "excludedCandidateCount": excluded_candidate_count,
+        "excludedCandidateTargets": sorted(excluded_task_ids_by_target),
+        "requestedTargetKeys": requested_target_keys,
         "updatedAt": datetime.now().isoformat(timespec="seconds"),
     }
     write_state(state, run_dir)
+
+    diagnostics: list[dict[str, Any]] = []
+    candidates: list[Any] = []
+    raw_backend_candidate_count = 0
+    login_preflight_records: list[dict[str, Any]] = []
+    login_preflight_refill_count = 0
+    def supplement_progress(event: dict[str, Any]) -> None:
+        state.setdefault("coverageSupplement", {})["progress"] = {
+            **event,
+            "updatedAt": datetime.now().isoformat(timespec="seconds"),
+        }
+        event_name = event.get("event")
+        if event_name == "query_start":
+            query_label = f"{event.get('queryField') or 'taxTypeId'}={event.get('queryValue') or event.get('taxTypeId') or ''}"
+            LOGGER.info(
+                "Coverage supplement query %s/%s: %s taxpayerType=%s targets=%s",
+                event.get("groupIndex"),
+                event.get("groupCount"),
+                query_label,
+                event.get("taxPayerType") or "",
+                ", ".join(event.get("targetKeys") or []),
+            )
+        elif event_name == "query_done":
+            query_label = f"{event.get('queryField') or 'taxTypeId'}={event.get('queryValue') or event.get('taxTypeId') or ''}"
+            LOGGER.info(
+                "Coverage supplement query %s/%s done: %s queried=%s elapsed=%ss",
+                event.get("groupIndex"),
+                event.get("groupCount"),
+                query_label,
+                event.get("queriedCount"),
+                event.get("elapsedSeconds"),
+            )
+        elif event_name == "target_done":
+            diagnostic = event.get("diagnostic") or {}
+            LOGGER.info(
+                "Coverage supplement target %s: matched=%s reason=%s statusCounts=%s",
+                diagnostic.get("targetKey"),
+                diagnostic.get("matchedTaskId") or "",
+                diagnostic.get("reason") or "",
+                diagnostic.get("statusCounts") or {},
+            )
+        elif event_name == "timeout":
+            query_label = f"{event.get('queryField') or 'taxTypeId'}={event.get('queryValue') or event.get('taxTypeId') or ''}"
+            LOGGER.warning(
+                "Coverage supplement search timed out at query %s/%s %s",
+                event.get("groupIndex"),
+                event.get("groupCount"),
+                query_label,
+            )
+        write_state(state, run_dir)
 
     try:
         with ProcessLock(
@@ -1298,20 +2275,87 @@ def run_coverage_supplement_phase(args: argparse.Namespace, state: dict[str, Any
         ):
             session = YdzSession(
                 cdp_port=args.cdp_port,
+                chrome_path=args.chrome_path,
                 user_data_dir=args.user_data_dir,
                 plugin_path=args.plugin_path,
                 launch_if_needed=True,
             )
             try:
                 context = session.connect()
-                planner = CoverageSupplementPlanner(ChanjetAdminTaskQuery(context))
-                candidates = planner.find_candidates(
+                admin_query = ChanjetAdminTaskQuery(context)
+                planner = CoverageSupplementPlanner(admin_query)
+                candidates, diagnostics = find_supplement_candidates_for_targets(
+                    planner,
                     missing_targets,
-                    start_time=start_time,
                     end_time=end_time,
-                    page_size=args.coverage_supplement_page_size,
+                    base_period=str(args.period or state.get("period") or ""),
+                    lookback_days=lookback_days,
+                    cit_lookback_days=cit_lookback_days,
+                    page_size=int(getattr(args, "coverage_supplement_page_size", 500) or 500),
+                    max_candidates_per_target=candidate_pool_limit,
+                    excluded_task_ids_by_target=excluded_task_ids_by_target,
+                    timeout_seconds=int(getattr(args, "coverage_supplement_timeout", 600) or 0),
+                    progress=supplement_progress,
                 )
-                diagnostics = planner.last_diagnostics
+                raw_backend_candidate_count = len(candidates)
+                if login_preflight_enabled and candidates:
+                    candidates, login_preflight_records = preflight_supplement_candidates_login_ready(
+                        candidates,
+                        admin_query,
+                    )
+                    preflight_exclusions = supplement_excluded_task_ids_from_preflight(login_preflight_records)
+                    if preflight_exclusions:
+                        excluded_task_ids_by_target = merge_excluded_task_id_maps(
+                            excluded_task_ids_by_target,
+                            preflight_exclusions,
+                        )
+                    last_preflight_records = login_preflight_records
+                    while (
+                        login_preflight_refill_count < SUPPLEMENT_LOGIN_PREFLIGHT_REFILL_MAX_WAVES
+                        and supplement_preflight_refill_needed(
+                            missing_targets,
+                            candidates,
+                            max_candidates=max_candidates,
+                            preflight_records=last_preflight_records,
+                        )
+                    ):
+                        login_preflight_refill_count += 1
+                        refill_candidates, refill_diagnostics = find_supplement_candidates_for_targets(
+                            planner,
+                            missing_targets,
+                            end_time=end_time,
+                            base_period=str(args.period or state.get("period") or ""),
+                            lookback_days=lookback_days,
+                            cit_lookback_days=cit_lookback_days,
+                            page_size=int(getattr(args, "coverage_supplement_page_size", 500) or 500),
+                            max_candidates_per_target=candidate_pool_limit,
+                            excluded_task_ids_by_target=merge_excluded_task_id_maps(
+                                excluded_task_ids_by_target,
+                                supplement_task_ids_by_target_from_candidates(candidates),
+                            ),
+                            timeout_seconds=int(getattr(args, "coverage_supplement_timeout", 600) or 0),
+                            progress=supplement_progress,
+                        )
+                        raw_backend_candidate_count += len(refill_candidates)
+                        diagnostics = merge_supplement_diagnostics([*diagnostics, *refill_diagnostics])
+                        if not refill_candidates:
+                            break
+                        refill_candidates, refill_records = preflight_supplement_candidates_login_ready(
+                            refill_candidates,
+                            admin_query,
+                        )
+                        login_preflight_records.extend(refill_records)
+                        last_preflight_records = refill_records
+                        refill_exclusions = supplement_excluded_task_ids_from_preflight(refill_records)
+                        if refill_exclusions:
+                            excluded_task_ids_by_target = merge_excluded_task_id_maps(
+                                excluded_task_ids_by_target,
+                                refill_exclusions,
+                            )
+                        previous_candidate_count = len(candidates)
+                        candidates = dedupe_supplement_candidates([*candidates, *refill_candidates])
+                        if len(candidates) == previous_candidate_count and not refill_exclusions:
+                            break
             finally:
                 session.close()
     except Exception as exc:
@@ -1321,57 +2365,2397 @@ def run_coverage_supplement_phase(args: argparse.Namespace, state: dict[str, Any
             "status": "failed",
             "message": message,
             "missingKeys": [target.key for target in missing_targets],
+            "requestedTargetKeys": requested_target_keys,
             "diagnostics": diagnostics,
+            "loginPreflight": login_preflight_records,
+            "preflightRefillCount": login_preflight_refill_count,
+            "excludedCandidateCount": sum(len(task_ids) for task_ids in excluded_task_ids_by_target.values()),
+            "excludedCandidateTargets": sorted(excluded_task_ids_by_target),
             "updatedAt": datetime.now().isoformat(timespec="seconds"),
         }
         write_state(state, run_dir)
         return 2
 
-    if not candidates:
+    can_try_ydz_cit_refresh = bool(getattr(args, "coverage_supplement_refresh_cit_from_ydz", False)) and any(
+        str(getattr(target, "tax_type", "") or "") == "CIT_A" for target in missing_targets
+    )
+    if not candidates and not can_try_ydz_cit_refresh:
         message = "后台未找到符合缺口税种和申报状态的成功取数任务。"
         LOGGER.info(message)
         state["coverageSupplement"] = {
             "status": "no_candidates",
             "message": message,
             "missingKeys": [target.key for target in missing_targets],
+            "requestedTargetKeys": requested_target_keys,
             "diagnostics": diagnostics,
             "candidateCount": 0,
+            "backendCandidateCount": raw_backend_candidate_count,
+            "preflightReadyCandidateCount": len(candidates),
+            "preflightRefillCount": login_preflight_refill_count,
+            "loginPreflight": login_preflight_records,
+            "excludedCandidateCount": sum(len(task_ids) for task_ids in excluded_task_ids_by_target.values()),
+            "excludedCandidateTargets": sorted(excluded_task_ids_by_target),
             "updatedAt": datetime.now().isoformat(timespec="seconds"),
         }
         write_state(state, run_dir)
         return 0
 
-    applied_keys = apply_supplement_candidates_to_state(state, candidates, enterprise=args.enterprise)
+    grouped_candidates = group_supplement_candidates_by_target(candidates, max_candidates=max_candidates)
+    if can_try_ydz_cit_refresh:
+        grouped_candidates = ensure_cit_refresh_template_candidates(
+            grouped_candidates,
+            missing_targets=missing_targets,
+            period=str(args.period or state.get("period") or ""),
+        )
+    ydz_refresh_records: list[dict[str, Any]] = []
+    if bool(getattr(args, "coverage_supplement_refresh_cit_from_ydz", False)):
+        state["coverageSupplement"].update(
+            {
+                "status": "refreshing_ydz_collect",
+                "message": "正在为企业所得税 A 类补齐候选尝试发起易代账新取数。",
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        write_state(state, run_dir)
+        grouped_candidates, ydz_refresh_records = refresh_cit_supplement_candidates_from_ydz(
+            args=args,
+            grouped_candidates=grouped_candidates,
+            max_candidates=max_candidates,
+        )
+        grouped_candidates = filter_supplement_candidates_with_task(grouped_candidates)
+    effective_candidate_count = sum(len(values) for values in grouped_candidates.values())
+    fresh_ydz_candidate_count = count_fresh_supplement_candidates(grouped_candidates)
+    if effective_candidate_count <= 0:
+        message = "No verifiable supplement taskId was produced by backend search or current-enterprise YDZ refresh."
+        LOGGER.info(message)
+        source_readiness = build_supplement_source_readiness(
+            missing_targets=missing_targets,
+            diagnostics=diagnostics,
+            candidates=candidates,
+            ydz_refresh_records=ydz_refresh_records,
+        )
+        state["coverageSupplement"] = {
+            "status": "no_candidates",
+            "message": message,
+            "missingKeys": [target.key for target in missing_targets],
+            "requestedTargetKeys": requested_target_keys,
+            "diagnostics": diagnostics,
+            "loginPreflight": login_preflight_records,
+            "sourceReadiness": source_readiness,
+            "candidateCount": 0,
+            "backendCandidateCount": raw_backend_candidate_count,
+            "preflightReadyCandidateCount": len(candidates),
+            "preflightRefillCount": login_preflight_refill_count,
+            "freshYdzCandidateCount": fresh_ydz_candidate_count,
+            "freshYdzRefresh": ydz_refresh_records,
+            "excludedCandidateCount": sum(len(task_ids) for task_ids in excluded_task_ids_by_target.values()),
+            "excludedCandidateTargets": sorted(excluded_task_ids_by_target),
+            "updatedAt": datetime.now().isoformat(timespec="seconds"),
+        }
+        write_state(state, run_dir)
+        return 0
+    applied_keys: list[str] = []
+    covered_keys: list[str] = []
+    attempts: list[dict[str, Any]] = []
     state["coverageSupplement"] = {
-        "status": "applied" if applied_keys else "not_applied",
-        "message": f"已从后台补齐 {len(applied_keys)} 个代表任务。" if applied_keys else "找到候选任务，但未写入新的待验证项。",
+        "status": "applying",
+        "message": f"已从后台找到 {len(candidates)} 个候选任务，开始按覆盖缺口逐个重试。",
         "missingKeys": [target.key for target in missing_targets],
+        "requestedTargetKeys": requested_target_keys,
         "diagnostics": diagnostics,
-        "candidateCount": len(candidates),
+        "loginPreflight": login_preflight_records,
+        "sourceReadiness": build_supplement_source_readiness(
+            missing_targets=missing_targets,
+            diagnostics=diagnostics,
+            candidates=candidates,
+            ydz_refresh_records=ydz_refresh_records,
+        ),
+        "candidateCount": effective_candidate_count,
+        "backendCandidateCount": raw_backend_candidate_count,
+        "preflightReadyCandidateCount": len(candidates),
+        "preflightRefillCount": login_preflight_refill_count,
+        "freshYdzCandidateCount": fresh_ydz_candidate_count,
+        "freshYdzRefresh": ydz_refresh_records,
+        "maxCandidatesPerTarget": max_candidates,
+        "candidatePoolLimitPerTarget": candidate_pool_limit,
+        "loginPreflightEnabled": login_preflight_enabled,
+        "excludedCandidateCount": sum(len(task_ids) for task_ids in excluded_task_ids_by_target.values()),
+        "excludedCandidateTargets": sorted(excluded_task_ids_by_target),
+        "startTime": start_time.isoformat(timespec="seconds"),
+        "endTime": end_time.isoformat(timespec="seconds"),
+        "lookbackDays": lookback_days,
+        "citLookbackDays": cit_lookback_days,
         "appliedItemKeys": applied_keys,
+        "coveredKeys": covered_keys,
+        "attempts": attempts,
         "updatedAt": datetime.now().isoformat(timespec="seconds"),
     }
-    for item_key in applied_keys:
-        item = state["items"].get(item_key) or {}
-        task_id = ((item.get("collect") or {}).get("verifyTaskId")) or ""
-        set_item_stage(
-            state,
-            run_dir,
-            item_key,
-            "task_resolved",
-            status="running",
-            message=f"后台补齐 taskId：{task_id}" if task_id else "后台补齐待验证任务。",
-        )
     write_state(state, run_dir)
-    if not applied_keys:
-        return 0
 
-    verify_exit = run_verify_phase(args, applied_keys, state, run_dir, final=True)
-    state["coverageSupplement"]["status"] = "verified"
-    state["coverageSupplement"]["verifyExitCode"] = verify_exit
-    state["coverageSupplement"]["updatedAt"] = datetime.now().isoformat(timespec="seconds")
+    verify_exit = 0
+    for target in missing_targets:
+        verify_exit = verify_supplement_target_candidates(
+            args=args,
+            state=state,
+            run_dir=run_dir,
+            coverage_targets=coverage_targets,
+            target=target,
+            target_candidates=grouped_candidates.get(target.key) or [],
+            attempts=attempts,
+            applied_keys=applied_keys,
+            covered_keys=covered_keys,
+            verify_exit=verify_exit,
+        )
+
+    coverage_after = write_coverage_status(run_dir, targets=coverage_targets)
+    remaining_missing = supplement_remaining_missing_keys(missing_targets, covered_keys)
+    verify_exit = supplement_final_verify_exit_code(
+        verify_exit=verify_exit,
+        remaining_missing=remaining_missing,
+        missing_targets=missing_targets,
+        covered_keys=covered_keys,
+        attempts=attempts,
+    )
+    state["coverageSupplement"].update(
+        {
+            "status": "verified",
+            "message": f"后台补齐已尝试 {len(attempts)} 个候选任务，覆盖 {len(covered_keys)} 个缺口，仍未覆盖 {len(remaining_missing)} 个缺口。",
+            "verifyExitCode": verify_exit,
+            "appliedItemKeys": applied_keys,
+            "coveredKeys": covered_keys,
+            "remainingMissingKeys": remaining_missing,
+            "loginPreflight": login_preflight_records,
+            "sourceReadiness": build_supplement_source_readiness(
+                missing_targets=missing_targets,
+                diagnostics=diagnostics,
+                candidates=candidates,
+                ydz_refresh_records=ydz_refresh_records,
+            ),
+            "updatedAt": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
     write_state(state, run_dir)
+    write_coverage_status(run_dir, targets=coverage_targets)
     return verify_exit
+
+
+def find_supplement_candidates_for_targets(
+    planner: CoverageSupplementPlanner,
+    missing_targets: list[Any],
+    end_time: datetime,
+    base_period: str,
+    lookback_days: int,
+    cit_lookback_days: int,
+    page_size: int,
+    max_candidates_per_target: int,
+    timeout_seconds: int,
+    excluded_task_ids_by_target: dict[str, set[str]] | None = None,
+    progress: Any = None,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    all_candidates: list[Any] = []
+    all_diagnostics: list[dict[str, Any]] = []
+    seen_candidate_keys: set[tuple[str, str]] = set()
+    candidate_counts: dict[str, int] = {}
+    candidate_task_ids_by_target: dict[str, set[str]] = {}
+    candidate_tax_nos_by_target: dict[str, set[str]] = {}
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
+    max_candidates = max(1, int(max_candidates_per_target or 1))
+
+    for targets, period, window_start, window_end, search_scope in supplement_search_batches(
+        missing_targets,
+        base_period=base_period,
+        end_time=end_time,
+        lookback_days=lookback_days,
+        cit_lookback_days=cit_lookback_days,
+    ):
+        active_targets = [
+            target
+            for target in targets
+            if candidate_counts.get(str(getattr(target, "key", "") or ""), 0) < max_candidates
+        ]
+        if not active_targets:
+            continue
+        if deadline and time.monotonic() >= deadline:
+            break
+        remaining_timeout = 0
+        if deadline:
+            remaining_timeout = max(1, int(deadline - time.monotonic()))
+
+        def progress_with_scope(event: dict[str, Any]) -> None:
+            event = dict(event)
+            event["searchScope"] = search_scope
+            event["searchPeriod"] = period
+            event["searchStartTime"] = window_start.isoformat(timespec="seconds")
+            event["searchEndTime"] = window_end.isoformat(timespec="seconds")
+            if progress:
+                progress(event)
+
+        batch_candidates = planner.find_candidates(
+            active_targets,
+            start_time=window_start,
+            end_time=window_end,
+            period=period or None,
+            page_size=page_size,
+            max_candidates_per_target=max_candidates,
+            excluded_task_ids_by_target=excluded_task_ids_by_target,
+            timeout_seconds=remaining_timeout,
+            progress=progress_with_scope,
+        )
+        for diagnostic in planner.last_diagnostics:
+            item = dict(diagnostic)
+            item["searchScope"] = search_scope
+            item["searchPeriod"] = period
+            item["searchStartTime"] = window_start.isoformat(timespec="seconds")
+            item["searchEndTime"] = window_end.isoformat(timespec="seconds")
+            all_diagnostics.append(item)
+        batch_candidates_by_target: dict[str, list[Any]] = {}
+        for candidate in batch_candidates:
+            target_key = str(getattr(candidate, "target_key", "") or "")
+            task_id = str(getattr(candidate, "task_id", "") or "")
+            if not target_key or not task_id:
+                continue
+            key = (target_key, task_id)
+            if key in seen_candidate_keys:
+                continue
+            if candidate_counts.get(target_key, 0) >= max_candidates:
+                continue
+            batch_candidates_by_target.setdefault(target_key, []).append(candidate)
+        for target_key, target_candidates in batch_candidates_by_target.items():
+            if candidate_counts.get(target_key, 0) >= max_candidates:
+                continue
+            selected_candidates = select_diverse_supplement_candidates(
+                target_candidates,
+                max_candidates - candidate_counts.get(target_key, 0),
+                existing_tax_nos=candidate_tax_nos_by_target.setdefault(target_key, set()),
+                existing_task_ids=candidate_task_ids_by_target.setdefault(target_key, set()),
+            )
+            for candidate in selected_candidates:
+                task_id = str(getattr(candidate, "task_id", "") or "")
+                key = (target_key, task_id)
+                if key in seen_candidate_keys:
+                    continue
+                if candidate_counts.get(target_key, 0) >= max_candidates:
+                    continue
+                tax_no = str(getattr(candidate, "tax_no", "") or "").strip()
+                seen_candidate_keys.add(key)
+                candidate_task_ids_by_target.setdefault(target_key, set()).add(task_id)
+                if tax_no:
+                    candidate_tax_nos_by_target.setdefault(target_key, set()).add(tax_no)
+                candidate_counts[target_key] = candidate_counts.get(target_key, 0) + 1
+                all_candidates.append(candidate)
+    return all_candidates, merge_supplement_diagnostics(all_diagnostics)
+
+
+def should_preflight_standard_supplement_candidates(missing_targets: list[Any]) -> bool:
+    return any(
+        str(getattr(target, "tax_type", "") or "") in STANDARD_SUPPLEMENT_LOGIN_PREFLIGHT_TAX_TYPES
+        for target in missing_targets
+    )
+
+
+def supplement_candidate_needs_login_preflight(candidate: Any) -> bool:
+    if not str(getattr(candidate, "task_id", "") or ""):
+        return False
+    if str(getattr(candidate, "reason", "") or "") == "fresh_ydz_collect":
+        return False
+    return str(getattr(candidate, "tax_type", "") or "") in STANDARD_SUPPLEMENT_LOGIN_PREFLIGHT_TAX_TYPES
+
+
+def preflight_supplement_candidate_login_ready(candidate: Any, page: Any) -> dict[str, Any]:
+    record = {
+        "targetKey": str(getattr(candidate, "target_key", "") or ""),
+        "taxType": str(getattr(candidate, "tax_type", "") or ""),
+        "taskId": str(getattr(candidate, "task_id", "") or ""),
+        "taxNo": str(getattr(candidate, "tax_no", "") or ""),
+        "status": "ready",
+        "stage": "",
+        "reason": "",
+    }
+    if not supplement_candidate_needs_login_preflight(candidate):
+        record["status"] = "skipped"
+        record["reason"] = "preflight_not_required"
+        return record
+    if page is None:
+        record["status"] = "unknown"
+        record["reason"] = "public_manage_page_unavailable"
+        return record
+
+    flow = TaskLoginFlow(_ContextPagesBrowserAdapter(getattr(page, "context", None)), timeout=1, poll_timeout=1)
+    task_id = record["taskId"]
+    client_job = fetch_client_job_once_for_preflight(page, task_id)
+    record["stage"] = "getClientJob"
+    if not isinstance(client_job, dict):
+        record["status"] = "not_ready"
+        record["failureCategory"] = "tax_login_expired"
+        record["reason"] = "getClientJob returned a non-object response"
+        return record
+    if client_job.get("_preflightError"):
+        record["status"] = "unknown"
+        record["reason"] = str(client_job.get("_preflightError") or "")
+        return record
+    if client_job.get("flag") == 0 or client_job.get("success") is False:
+        message = str(client_job.get("msg") or client_job.get("message") or "")
+        record["status"] = "not_ready"
+        record["reason"] = f"getClientJob failed: {message}"
+        if flow._is_pending_client_job_message(message) or flow._client_job_needs_force_tax(client_job):
+            record["failureCategory"] = "tax_login_blocked"
+        else:
+            record["failureCategory"] = "tax_login_expired"
+        return record
+    if flow._client_job_needs_force_tax(client_job):
+        record["status"] = "not_ready"
+        record["failureCategory"] = "tax_login_blocked"
+        record["reason"] = "getClientJob returned needForceTax=true"
+        return record
+    if not flow._client_job_has_login_metadata(client_job):
+        record["status"] = "not_ready"
+        record["failureCategory"] = "tax_login_expired"
+        record["reason"] = f"getClientJob returned incomplete tax-login metadata: {flow._client_job_response_summary(client_job)}"
+        return record
+
+    data = client_job.get("data") if isinstance(client_job.get("data"), dict) else {}
+    inner_task_id = flow._client_job_inner_task_id(data)
+    machine_id = preflight_machine_id(page)
+    task_cookie = fetch_task_cookie_once_for_preflight(page, inner_task_id, machine_id)
+    record["stage"] = "getTaskCookie"
+    if not isinstance(task_cookie, dict):
+        record["status"] = "not_ready"
+        record["failureCategory"] = "tax_login_expired"
+        record["reason"] = "getTaskCookie returned a non-object response"
+        return record
+    if task_cookie.get("_preflightError"):
+        record["status"] = "unknown"
+        record["reason"] = str(task_cookie.get("_preflightError") or "")
+        return record
+    if task_cookie.get("flag") == 1 and task_cookie.get("data"):
+        record["status"] = "ready"
+        record["reason"] = "login_metadata_ready"
+        return record
+    if task_cookie.get("flag") == 0:
+        message = str(task_cookie.get("msg") or task_cookie.get("message") or "")
+        record["status"] = "not_ready"
+        record["failureCategory"] = classify_supplement_failure_category(f"getTaskCookie failed: {message}")
+        record["reason"] = f"getTaskCookie failed: {message}"
+        return record
+    record["status"] = "unknown"
+    record["reason"] = f"getTaskCookie did not return ready data: flag={task_cookie.get('flag')}"
+    return record
+
+
+def preflight_supplement_candidates_login_ready(
+    candidates: list[Any],
+    admin_query: Any,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    if not candidates:
+        return [], []
+    if not any(supplement_candidate_needs_login_preflight(candidate) for candidate in candidates):
+        return candidates, []
+    page = None
+    if hasattr(admin_query, "_ensure_page"):
+        try:
+            page = admin_query._ensure_page()
+        except Exception as exc:
+            page = None
+            unavailable_reason = f"login preflight page unavailable: {compact_message(exc, limit=180)}"
+        else:
+            unavailable_reason = ""
+    else:
+        unavailable_reason = "login preflight page unavailable: admin query has no browser page"
+
+    filtered: list[Any] = []
+    records: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not supplement_candidate_needs_login_preflight(candidate):
+            filtered.append(candidate)
+            continue
+        if page is None:
+            record = {
+                "targetKey": str(getattr(candidate, "target_key", "") or ""),
+                "taxType": str(getattr(candidate, "tax_type", "") or ""),
+                "taskId": str(getattr(candidate, "task_id", "") or ""),
+                "taxNo": str(getattr(candidate, "tax_no", "") or ""),
+                "status": "unknown",
+                "stage": "preflight",
+                "reason": unavailable_reason,
+            }
+        else:
+            record = preflight_supplement_candidate_login_ready(candidate, page)
+        records.append(record)
+        if record.get("status") != "not_ready":
+            filtered.append(candidate)
+    return filtered, records
+
+
+def dedupe_supplement_candidates(candidates: list[Any]) -> list[Any]:
+    deduped: list[Any] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for candidate in candidates or []:
+        key = (
+            str(getattr(candidate, "target_key", "") or ""),
+            str(getattr(candidate, "task_id", "") or ""),
+            str(getattr(candidate, "tax_no", "") or ""),
+            str(getattr(candidate, "reason", "") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def supplement_task_ids_by_target_from_candidates(candidates: list[Any]) -> dict[str, set[str]]:
+    task_ids_by_target: dict[str, set[str]] = {}
+    for candidate in candidates or []:
+        target_key = str(getattr(candidate, "target_key", "") or "")
+        task_id = str(getattr(candidate, "task_id", "") or "")
+        if target_key and task_id:
+            task_ids_by_target.setdefault(target_key, set()).add(task_id)
+    return task_ids_by_target
+
+
+def supplement_excluded_task_ids_from_preflight(records: list[dict[str, Any]]) -> dict[str, set[str]]:
+    excluded: dict[str, set[str]] = {}
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("status") or "") != "not_ready":
+            continue
+        target_key = str(record.get("targetKey") or "")
+        task_id = str(record.get("taskId") or "")
+        if not target_key or not task_id:
+            continue
+        category = str(record.get("failureCategory") or "")
+        if not category:
+            category = classify_supplement_failure_category(str(record.get("reason") or ""))
+        if category not in STABLE_SUPPLEMENT_EXCLUDE_CATEGORIES:
+            continue
+        excluded.setdefault(target_key, set()).add(task_id)
+    return excluded
+
+
+def supplement_preflight_refill_needed(
+    missing_targets: list[Any],
+    candidates: list[Any],
+    max_candidates: int,
+    preflight_records: list[dict[str, Any]],
+) -> bool:
+    not_ready_targets = {
+        str(record.get("targetKey") or "")
+        for record in preflight_records or []
+        if isinstance(record, dict) and str(record.get("status") or "") == "not_ready"
+    }
+    if not_ready_targets:
+        grouped = group_supplement_candidates_by_target(candidates, max_candidates=max_candidates)
+        for target in missing_targets or []:
+            target_key = str(getattr(target, "key", "") or "")
+            if target_key in not_ready_targets and len(grouped.get(target_key) or []) < max(1, int(max_candidates or 1)):
+                return True
+    return False
+
+
+class _ContextPagesBrowserAdapter:
+    def __init__(self, context: Any) -> None:
+        self.context = context
+
+    def get_all_pages(self) -> list[Any]:
+        if self.context is None:
+            return []
+        return list(getattr(self.context, "pages", []) or [])
+
+
+def fetch_client_job_once_for_preflight(page: Any, task_id: str) -> dict[str, Any]:
+    try:
+        return page.evaluate(
+            """async ({url, taskId}) => {
+                try {
+                    const requestUrl = `${url}?taskId=${taskId}&orgLoginType=NATIONAL&etaxPluginVersion=2.1.0.109`;
+                    const auth = sessionStorage.getItem('Authorization') || localStorage.getItem('Authorization') || '';
+                    const accessToken =
+                        sessionStorage.getItem('access_token') ||
+                        localStorage.getItem('access_token') ||
+                        sessionStorage.getItem('token') ||
+                        localStorage.getItem('token') ||
+                        '';
+                    const headers = { "Content-Type": "application/json" };
+                    if (auth) headers["authorization"] = auth.startsWith('Bearer ') ? auth : "Bearer " + auth;
+                    if (accessToken) headers["token"] = accessToken;
+                    const resp = await fetch(requestUrl, { method: "GET", headers, credentials: "include" });
+                    const text = await resp.text();
+                    try {
+                        return JSON.parse(text);
+                    } catch (err) {
+                        return { flag: 0, _preflightNonJson: true, msg: text.slice(0, 240) };
+                    }
+                } catch (err) {
+                    return { _preflightError: String(err && err.message || err) };
+                }
+            }""",
+            {"url": GET_CLIENT_JOB_URL, "taskId": task_id},
+        )
+    except Exception as exc:
+        return {"_preflightError": str(exc)}
+
+
+def fetch_task_cookie_once_for_preflight(page: Any, inner_task_id: str, machine_id: str) -> dict[str, Any]:
+    try:
+        return page.evaluate(
+            """async ({taskId, machineId, fallbackUrl}) => {
+                try {
+                    const apiRoot = window.etaxPlugin_getApiRoot ? window.etaxPlugin_getApiRoot() : fallbackUrl.replace('/api/client/getTaskCookie', '');
+                    const resp = await fetch(`${apiRoot}/api/client/getTaskCookie`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ taskId, machineId })
+                    });
+                    const text = await resp.text();
+                    try {
+                        return JSON.parse(text);
+                    } catch (err) {
+                        return { flag: 0, _preflightNonJson: true, msg: text.slice(0, 240) };
+                    }
+                } catch (err) {
+                    return { _preflightError: String(err && err.message || err) };
+                }
+            }""",
+            {
+                "taskId": inner_task_id,
+                "machineId": machine_id,
+                "fallbackUrl": GET_TASK_COOKIE_FALLBACK_URL,
+            },
+        )
+    except Exception as exc:
+        return {"_preflightError": str(exc)}
+
+
+def preflight_machine_id(page: Any) -> str:
+    try:
+        machine_id = str(page.evaluate("window.robotId || ''") or "").strip()
+    except Exception:
+        machine_id = ""
+    return machine_id or DEFAULT_MACHINE_ID
+
+
+def supplement_search_batches(
+    missing_targets: list[Any],
+    base_period: str,
+    end_time: datetime,
+    lookback_days: int,
+    cit_lookback_days: int,
+) -> list[tuple[list[Any], str, datetime, datetime, str]]:
+    base_period = str(base_period or "")
+    batches: list[tuple[list[Any], str, datetime, datetime, str]] = []
+    non_cit_targets = [target for target in missing_targets if str(getattr(target, "tax_type", "") or "") != "CIT_A"]
+    cit_targets = [target for target in missing_targets if str(getattr(target, "tax_type", "") or "") == "CIT_A"]
+    for window_start, window_end in supplement_time_windows(end_time, lookback_days):
+        if non_cit_targets:
+            batches.append((non_cit_targets, base_period, window_start, window_end, "default"))
+    if cit_targets:
+        cit_windows = supplement_time_windows(end_time, max(lookback_days, cit_lookback_days))
+        for period in supplement_cit_candidate_periods(base_period):
+            for window_start, window_end in cit_windows:
+                batches.append((cit_targets, period, window_start, window_end, "cit_period_scan"))
+    return batches
+
+
+def supplement_time_windows(end_time: datetime, lookback_days: int) -> list[tuple[datetime, datetime]]:
+    if lookback_days <= 0:
+        return [(end_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0), end_time)]
+    start_time = end_time - timedelta(days=lookback_days)
+    windows: list[tuple[datetime, datetime]] = []
+    cursor_end = end_time
+    max_window = timedelta(days=MAX_SUPPLEMENT_QUERY_WINDOW_DAYS)
+    while cursor_end > start_time:
+        cursor_start = max(start_time, cursor_end - max_window)
+        windows.append((cursor_start, cursor_end))
+        cursor_end = cursor_start - timedelta(seconds=1)
+    return windows
+
+
+def supplement_cit_candidate_periods(base_period: str) -> list[str]:
+    period = normalize_period_yyyymm(base_period)
+    if not period:
+        return []
+    year = int(period[:4])
+    month = int(period[4:6])
+    periods = [add_months_to_period(period, offset) for offset in range(0, -12, -1)]
+    quarter = latest_quarter_end_period(year, month)
+    periods.extend(
+        [
+            quarter,
+            add_months_to_period(quarter, -3),
+            add_months_to_period(quarter, -6),
+            add_months_to_period(quarter, -9),
+            f"{year - 1}12",
+        ]
+    )
+    return unique_texts([item for item in periods if item])
+
+
+def normalize_period_yyyymm(value: Any) -> str:
+    text = re.sub(r"\D", "", str(value or ""))
+    if len(text) < 6:
+        return ""
+    text = text[:6]
+    month = int(text[4:6])
+    if month < 1 or month > 12:
+        return ""
+    return text
+
+
+def latest_quarter_end_period(year: int, month: int) -> str:
+    quarter_month = month if month % 3 == 0 else ((month - 1) // 3) * 3
+    if quarter_month <= 0:
+        year -= 1
+        quarter_month = 12
+    return f"{year}{quarter_month:02d}"
+
+
+def add_months_to_period(period: str, months: int) -> str:
+    normalized = normalize_period_yyyymm(period)
+    if not normalized:
+        return ""
+    year = int(normalized[:4])
+    month = int(normalized[4:6])
+    absolute = year * 12 + (month - 1) + int(months)
+    new_year = absolute // 12
+    new_month = absolute % 12 + 1
+    return f"{new_year}{new_month:02d}"
+
+
+def merge_supplement_diagnostics(diagnostics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for diagnostic in diagnostics:
+        target_key = str(diagnostic.get("targetKey") or "")
+        if not target_key:
+            continue
+        if target_key not in merged:
+            item = dict(diagnostic)
+            item["queriedCount"] = int(diagnostic.get("queriedCount") or 0)
+            item["statusCounts"] = dict(diagnostic.get("statusCounts") or {})
+            item["statusTaskIds"] = copy_status_task_ids(diagnostic.get("statusTaskIds") or {})
+            item["taskTaxTypeCounts"] = dict(diagnostic.get("taskTaxTypeCounts") or {})
+            item["cbjModeSourceCounts"] = dict(diagnostic.get("cbjModeSourceCounts") or {})
+            item["matchedTaskIds"] = list(diagnostic.get("matchedTaskIds") or [])
+            item["excludedTaskCount"] = int(diagnostic.get("excludedTaskCount") or 0)
+            item["excludedTaskIds"] = list(diagnostic.get("excludedTaskIds") or [])
+            item["candidateCount"] = len(item["matchedTaskIds"])
+            item["searchPeriods"] = unique_texts([diagnostic.get("searchPeriod") or ""])
+            item["searchWindows"] = unique_texts(
+                [
+                    "-".join(
+                        part
+                        for part in (
+                            str(diagnostic.get("searchStartTime") or ""),
+                            str(diagnostic.get("searchEndTime") or ""),
+                        )
+                        if part
+                    )
+                ]
+            )
+            merged[target_key] = item
+            order.append(target_key)
+            continue
+        item = merged[target_key]
+        item["queriedCount"] = int(item.get("queriedCount") or 0) + int(diagnostic.get("queriedCount") or 0)
+        merge_count_dict(item.setdefault("statusCounts", {}), diagnostic.get("statusCounts") or {})
+        merge_status_task_ids(item.setdefault("statusTaskIds", {}), diagnostic.get("statusTaskIds") or {})
+        merge_count_dict(item.setdefault("taskTaxTypeCounts", {}), diagnostic.get("taskTaxTypeCounts") or {})
+        merge_count_dict(item.setdefault("cbjModeSourceCounts", {}), diagnostic.get("cbjModeSourceCounts") or {})
+        for task_id in diagnostic.get("matchedTaskIds") or []:
+            append_unique(item.setdefault("matchedTaskIds", []), str(task_id))
+        item["excludedTaskCount"] = int(item.get("excludedTaskCount") or 0) + int(
+            diagnostic.get("excludedTaskCount") or 0
+        )
+        for task_id in diagnostic.get("excludedTaskIds") or []:
+            append_unique(item.setdefault("excludedTaskIds", []), str(task_id))
+        append_unique(item.setdefault("searchPeriods", []), str(diagnostic.get("searchPeriod") or ""))
+        window = "-".join(
+            part
+            for part in (
+                str(diagnostic.get("searchStartTime") or ""),
+                str(diagnostic.get("searchEndTime") or ""),
+            )
+            if part
+        )
+        append_unique(item.setdefault("searchWindows", []), window)
+        if item.get("matchedTaskIds"):
+            item["matchedTaskId"] = item.get("matchedTaskId") or item["matchedTaskIds"][0]
+            item["candidateCount"] = len(item["matchedTaskIds"])
+            item["reason"] = "matched_backend_result_json"
+        elif diagnostic_priority(str(diagnostic.get("reason") or "")) > diagnostic_priority(str(item.get("reason") or "")):
+            item["reason"] = diagnostic.get("reason") or item.get("reason") or ""
+    for item in merged.values():
+        if item.get("matchedTaskIds"):
+            item["matchedTaskId"] = item.get("matchedTaskId") or item["matchedTaskIds"][0]
+            item["candidateCount"] = len(item["matchedTaskIds"])
+            item["reason"] = "matched_backend_result_json"
+    return [merged[key] for key in order]
+
+
+def merge_count_dict(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key, value in source.items():
+        try:
+            count = int(value or 0)
+        except (TypeError, ValueError):
+            count = 0
+        target[key] = int(target.get(key) or 0) + count
+
+
+def copy_status_task_ids(source: dict[str, Any]) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    merge_status_task_ids(result, source)
+    return result
+
+
+def merge_status_task_ids(target: dict[str, list[str]], source: dict[str, Any], limit: int = 20) -> None:
+    for key, values in source.items():
+        bucket = target.setdefault(str(key), [])
+        for task_id in values or []:
+            if len(bucket) >= limit:
+                break
+            append_unique(bucket, task_id)
+
+
+def diagnostic_priority(reason: str) -> int:
+    return {
+        "matched_backend_result_json": 100,
+        "declaration_status_not_matched": 80,
+        "target_tax_type_not_matched": 70,
+        "declaration_status_unknown": 60,
+        "no_success_collect_tasks": 50,
+        "supplement_search_timeout": 40,
+        "excluded_known_failed_candidates": 30,
+    }.get(str(reason or ""), 0)
+
+
+def supplement_candidate_status_rank(candidate: Any) -> int:
+    target_status = str(getattr(candidate, "declaration_status", "") or "")
+    parse_status = str(getattr(candidate, "parse_status", "") or "")
+    if not target_status or target_status == "any":
+        return 0
+    if parse_status == target_status:
+        return 0
+    if parse_status == "unknown":
+        return 1
+    if not parse_status:
+        return 2
+    return 3
+
+
+def supplement_target_tax_type_from_key(target_key: Any) -> str:
+    return str(target_key or "").split(":", 1)[0].strip().upper()
+
+
+def effective_supplement_max_candidates(configured: int, missing_targets: list[Any]) -> int:
+    return max(1, int(configured or 1))
+
+
+def supplement_candidate_source_rank(candidate: Any) -> int:
+    reason = str(getattr(candidate, "reason", "") or "")
+    if reason == "fresh_ydz_collect":
+        return 0
+    return 1
+
+
+def supplement_candidate_sort_key(candidate: Any) -> tuple[Any, ...]:
+    return (
+        str(getattr(candidate, "target_key", "")),
+        supplement_candidate_source_rank(candidate),
+        supplement_candidate_status_rank(candidate),
+        -(int(getattr(candidate, "created_stamp", 0) or 0)),
+        str(getattr(candidate, "task_id", "")),
+    )
+
+
+def group_supplement_candidates_by_target(candidates: list[Any], max_candidates: int = 1) -> dict[str, list[Any]]:
+    max_candidates = max(1, int(max_candidates or 1))
+    grouped: dict[str, list[Any]] = {}
+    for candidate in sorted(candidates, key=supplement_candidate_sort_key):
+        key = str(getattr(candidate, "target_key", "") or "")
+        if not key:
+            continue
+        values = grouped.setdefault(key, [])
+        if len(values) < max_candidates:
+            values.append(candidate)
+    return grouped
+
+
+def count_fresh_supplement_candidates(grouped_candidates: dict[str, list[Any]]) -> int:
+    return sum(
+        1
+        for candidates in grouped_candidates.values()
+        for candidate in candidates
+        if str(getattr(candidate, "reason", "") or "") == "fresh_ydz_collect"
+    )
+
+
+def ensure_cit_refresh_template_candidates(
+    grouped_candidates: dict[str, list[Any]],
+    missing_targets: list[Any],
+    period: str,
+) -> dict[str, list[Any]]:
+    refreshed = {key: list(values) for key, values in grouped_candidates.items()}
+    for target in missing_targets:
+        if str(getattr(target, "tax_type", "") or "") != "CIT_A":
+            continue
+        key = str(getattr(target, "key", "") or "")
+        if not key or refreshed.get(key):
+            continue
+        refreshed[key] = [supplement_template_candidate_for_target(target, period)]
+    return refreshed
+
+
+def supplement_template_candidate_for_target(target: Any, period: str) -> SupplementCandidate:
+    backend_tax_ids = tuple(getattr(target, "backend_tax_ids", ()) or ())
+    backend_tax_type_ids = tuple(getattr(target, "backend_tax_type_ids", ()) or ())
+    query_field = "taxId" if backend_tax_ids else "taxTypeId"
+    query_id = backend_tax_ids[0] if backend_tax_ids else (backend_tax_type_ids[0] if backend_tax_type_ids else "")
+    return SupplementCandidate(
+        target_key=str(getattr(target, "key", "") or ""),
+        tax_type=str(getattr(target, "tax_type", "") or ""),
+        tax_type_name=str(getattr(target, "tax_type_name", "") or ""),
+        declaration_status=str(getattr(target, "declaration_status", "") or ""),
+        declaration_status_name=str(getattr(target, "declaration_status_name", "") or ""),
+        task_id="",
+        tax_no="",
+        period=str(period or ""),
+        task_status="",
+        backend_tax_type_id=str(query_id) if query_field == "taxTypeId" else "",
+        backend_tax_id=str(query_id) if query_field == "taxId" else "",
+        backend_query_field=query_field,
+        created_stamp=0,
+        parse_status="unknown",
+        reason="current_enterprise_scan_template",
+    )
+
+
+def filter_supplement_candidates_with_task(grouped_candidates: dict[str, list[Any]]) -> dict[str, list[Any]]:
+    filtered: dict[str, list[Any]] = {}
+    for target_key, candidates in grouped_candidates.items():
+        with_task = [candidate for candidate in candidates if str(getattr(candidate, "task_id", "") or "")]
+        if with_task:
+            filtered[target_key] = with_task
+    return filtered
+
+
+def build_supplement_source_readiness(
+    missing_targets: list[Any],
+    diagnostics: list[dict[str, Any]],
+    candidates: list[Any],
+    ydz_refresh_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    diagnostics_by_key = {str(item.get("targetKey") or ""): item for item in diagnostics or []}
+    candidates_by_key: dict[str, list[Any]] = {}
+    for candidate in candidates or []:
+        candidates_by_key.setdefault(str(getattr(candidate, "target_key", "") or ""), []).append(candidate)
+    refresh_by_key: dict[str, list[dict[str, Any]]] = {}
+    for record in ydz_refresh_records or []:
+        keys = [key.strip() for key in str(record.get("targetKey") or "").split(",") if key.strip()]
+        for key in keys:
+            refresh_by_key.setdefault(key, []).append(record)
+
+    readiness: list[dict[str, Any]] = []
+    for target in missing_targets or []:
+        if isinstance(target, dict):
+            target_key = str(target.get("key") or "")
+        else:
+            target_key = str(getattr(target, "key", "") or "")
+        if not target_key:
+            continue
+        target_candidates = candidates_by_key.get(target_key) or []
+        target_records = refresh_by_key.get(target_key) or []
+        diagnostic = diagnostics_by_key.get(target_key) or {}
+        diagnostic_task_ids = [
+            str(task_id)
+            for task_id in (diagnostic.get("matchedTaskIds") or [])
+            if str(task_id or "")
+        ]
+        backend_candidate_count = len(target_candidates) or len(diagnostic_task_ids)
+        ydz_status, ydz_reason = classify_ydz_source_readiness(target_records)
+        status = classify_supplement_source_readiness(
+            backend_candidate_count=backend_candidate_count,
+            backend_reason=str(diagnostic.get("reason") or ""),
+            ydz_status=ydz_status,
+        )
+        account_count = max_int_field(target_records, "accountCount")
+        cit_signal_count = max_int_field(target_records, "citSignalCount")
+        enterprise_suggestions = ydz_enterprise_scan_suggestions(target_records)
+        enterprise_scan_count = len(
+            [
+                record
+                for record in target_records
+                if str(record.get("source") or "") in YDZ_EXTERNAL_ACCOUNT_SCAN_SOURCES
+            ]
+        )
+        enterprise_scan_error = first_ydz_enterprise_scan_error(target_records)
+        row = {
+            "targetKey": target_key,
+            "status": status,
+            "message": supplement_source_readiness_message(
+                status=status,
+                backend_candidate_count=backend_candidate_count,
+                account_count=account_count,
+                cit_signal_count=cit_signal_count,
+                enterprise_suggestions=enterprise_suggestions,
+                enterprise_scan_count=enterprise_scan_count,
+                enterprise_scan_error=enterprise_scan_error,
+            ),
+            "nextAction": supplement_source_readiness_next_action(status),
+            "backendCandidateCount": backend_candidate_count,
+            "backendReason": str(diagnostic.get("reason") or ""),
+            "backendMatchedTaskIds": diagnostic_task_ids,
+            "ydzStatus": ydz_status,
+            "ydzReason": ydz_reason,
+            "ydzAccountCount": account_count,
+            "ydzCitSignalCount": cit_signal_count,
+            "ydzEnterpriseScanCount": enterprise_scan_count,
+            "ydzEnterpriseSuggestions": enterprise_suggestions,
+            "ydzEnterpriseScanError": enterprise_scan_error,
+        }
+        readiness.append(row)
+    return readiness
+
+
+def classify_ydz_source_readiness(records: list[dict[str, Any]]) -> tuple[str, str]:
+    reasons = {str(record.get("reason") or "") for record in records or []}
+    has_task = any(record.get("taskIds") for record in records or [])
+    if has_task or any(str(record.get("status") or "") == "resolved" for record in records or []):
+        return "fresh_task_resolved", "fresh_ydz_collect_task_resolved"
+    no_need_record = next(
+        (
+            record
+            for record in records or []
+            if str(record.get("collectStatus") or "").upper() == "NO_NEED_COLLECTED"
+        ),
+        None,
+    )
+    if no_need_record is not None:
+        return "ydz_no_need_collect", str(no_need_record.get("reason") or "NO_NEED_COLLECTED")
+    external_account_records = [
+        record for record in records or [] if str(record.get("source") or "") in YDZ_EXTERNAL_ACCOUNT_SCAN_SOURCES
+    ]
+    if any(max_int_field([record], "citSignalCount") > 0 for record in external_account_records):
+        return "other_enterprise_has_cit_signal", "other_enterprise_account_scan_found_cit_signal"
+    if any(is_ydz_enterprise_scan_login_required(record) for record in records or []):
+        return "other_enterprise_scan_login_required", "other_enterprise_scan_login_required"
+    failed_external_source_reason = next(
+        (
+            str(record.get("reason") or "")
+            for record in external_account_records
+            if str(record.get("status") or "") == "failed" and str(record.get("reason") or "")
+        ),
+        "",
+    )
+    if failed_external_source_reason:
+        return "other_enterprise_scan_unavailable", failed_external_source_reason
+    login_reason = next((reason for reason in reasons if is_ydz_login_required_reason(reason)), "")
+    if login_reason:
+        return "ydz_login_required", login_reason
+    if "current_enterprise_scan_no_cit_account_signal" in reasons:
+        return "current_enterprise_no_cit_signal", "current_enterprise_scan_no_cit_account_signal"
+    if external_account_records:
+        return "other_enterprise_no_cit_signal", "other_enterprise_account_scan_no_cit_signal"
+    if "no_ydz_account_in_current_enterprise" in reasons:
+        return "candidate_not_in_current_enterprise", "no_ydz_account_in_current_enterprise"
+    if "current_enterprise_scan_no_fresh_task_id" in reasons:
+        return "current_enterprise_no_fresh_task", "current_enterprise_scan_no_fresh_task_id"
+    if records:
+        return "checked_no_fresh_task", next((reason for reason in reasons if reason), "checked_no_fresh_task")
+    return "not_checked", ""
+
+
+def classify_supplement_source_readiness(
+    backend_candidate_count: int,
+    backend_reason: str,
+    ydz_status: str,
+) -> str:
+    if ydz_status == "fresh_task_resolved":
+        return "fresh_task_ready"
+    if ydz_status == "other_enterprise_has_cit_signal":
+        return "other_enterprise_has_cit_signal"
+    if ydz_status == "other_enterprise_scan_login_required":
+        return "other_enterprise_scan_login_required"
+    if ydz_status == "other_enterprise_scan_unavailable":
+        return "other_enterprise_scan_unavailable"
+    if ydz_status == "ydz_login_required":
+        return "ydz_login_required"
+    if ydz_status == "ydz_no_need_collect":
+        return "ydz_no_need_collect"
+    if ydz_status == "current_enterprise_no_cit_signal":
+        return "current_enterprise_no_cit_signal"
+    if ydz_status == "other_enterprise_no_cit_signal":
+        return "other_enterprise_no_cit_signal"
+    if ydz_status == "candidate_not_in_current_enterprise" and backend_candidate_count > 0:
+        return "backend_candidates_not_refreshable"
+    if backend_candidate_count > 0:
+        return "backend_candidates_only"
+    if backend_reason:
+        return "backend_no_usable_candidate"
+    return "no_source_checked"
+
+
+def supplement_source_readiness_message(
+    status: str,
+    backend_candidate_count: int,
+    account_count: int,
+    cit_signal_count: int,
+    enterprise_suggestions: list[dict[str, Any]] | None = None,
+    enterprise_scan_count: int = 0,
+    enterprise_scan_error: str = "",
+) -> str:
+    if status == "fresh_task_ready":
+        return "\u5df2\u751f\u6210\u65b0\u7684\u6613\u4ee3\u8d26\u53d6\u6570 taskId\uff0c\u53ef\u7ee7\u7eed\u9a8c\u8bc1\u8be5\u8986\u76d6\u7f3a\u53e3\u3002"
+    if status == "other_enterprise_has_cit_signal":
+        suggestion = (enterprise_suggestions or [{}])[0]
+        enterprise = str(suggestion.get("enterprise") or "")
+        signal_count = int(suggestion.get("citSignalCount") or 0)
+        samples = ", ".join(str(item) for item in (suggestion.get("sampleTaxNos") or [])[:3] if str(item or ""))
+        sample_text = f"\uff0c\u6837\u4f8b\u7a0e\u53f7\uff1a{samples}" if samples else ""
+        return (
+            f"\u5df2\u5728\u5176\u4ed6\u6613\u4ee3\u8d26\u4f01\u4e1a\u6216\u6307\u5b9a work.html \u6765\u6e90\u300c{enterprise}\u300d"
+            f"\u627e\u5230 {signal_count} \u4e2a\u4f01\u4e1a\u6240\u5f97\u7a0e A \u7c7b\u8d26\u5957{sample_text}\u3002"
+        )
+    if status == "current_enterprise_no_cit_signal":
+        return (
+            "\u5f53\u524d\u6613\u4ee3\u8d26\u4f01\u4e1a\u5df2\u626b\u63cf"
+            f" {account_count} \u4e2a\u8d26\u5957\uff0c\u4f46\u4f01\u4e1a\u6240\u5f97\u7a0e A \u7c7b\u4fe1\u53f7\u6570\u4e3a {cit_signal_count}\uff0c"
+            "\u4e0d\u9002\u5408\u968f\u673a\u53d1\u8d77\u65b0\u53d6\u6570\u3002"
+        )
+    if status == "other_enterprise_scan_login_required":
+        detail = f"\u8be6\u60c5\uff1a{enterprise_scan_error}" if enterprise_scan_error else ""
+        return (
+            "\u5f53\u524d\u4f01\u4e1a\u65e0\u4f01\u4e1a\u6240\u5f97\u7a0e A \u7c7b\u8d26\u5957\u4fe1\u53f7\uff0c"
+            "\u4f46\u626b\u63cf\u5176\u4ed6\u6613\u4ee3\u8d26\u4f01\u4e1a\u65f6\u7f3a\u5c11\u53ef\u7528\u767b\u5f55\u6001\u6216\u51ed\u636e\u3002"
+            f"{detail}"
+        )
+    if status == "other_enterprise_scan_unavailable":
+        detail = f"\u8be6\u60c5\uff1a{enterprise_scan_error}" if enterprise_scan_error else ""
+        return (
+            "\u5f53\u524d\u6613\u4ee3\u8d26\u4f01\u4e1a\u65e0\u4f01\u4e1a\u6240\u5f97\u7a0e A \u7c7b\u8d26\u5957\u4fe1\u53f7\uff0c"
+            "\u5176\u4ed6\u4f01\u4e1a\u7684\u6613\u4ee3\u8d26\u5e94\u7528\u6682\u672a\u80fd\u81ea\u52a8\u6253\u5f00\u6216\u65e0\u53ef\u7528\u5165\u53e3\u3002"
+            f"{detail}"
+        )
+    if status == "ydz_login_required":
+        return (
+            "\u6613\u4ee3\u8d26\u4f1a\u8bdd\u6216\u63a5\u53e3 token \u4e0d\u53ef\u7528\uff0c"
+            "\u65e0\u6cd5\u5c06\u5f53\u524d\u4f01\u4e1a\u5237\u65b0\u6210\u65b0\u53d6\u6570 taskId\u3002"
+        )
+    if status == "ydz_no_need_collect":
+        return (
+            "\u6613\u4ee3\u8d26\u5df2\u6210\u529f\u53d1\u8d77\u65b0\u53d6\u6570\uff0c"
+            "\u4f46\u8fd4\u56de\u672c\u671f\u65e0\u9700\u7533\u62a5\u6216\u65e0\u9700\u53d6\u6570\uff0c"
+            "\u672a\u751f\u6210\u53ef\u7528\u7684\u9a8c\u8bc1 taskId\u3002"
+        )
+    if status == "other_enterprise_no_cit_signal":
+        return (
+            f"\u5df2\u626b\u63cf {enterprise_scan_count} \u4e2a\u5176\u4ed6\u6613\u4ee3\u8d26\u4f01\u4e1a\u6216\u6307\u5b9a work.html \u6765\u6e90\uff0c"
+            "\u6682\u672a\u627e\u5230\u4f01\u4e1a\u6240\u5f97\u7a0e A \u7c7b\u8d26\u5957\u4fe1\u53f7\u3002"
+        )
+    if status == "backend_candidates_not_refreshable":
+        return (
+            f"\u540e\u53f0\u6709 {backend_candidate_count} \u4e2a\u5386\u53f2\u5019\u9009\uff0c"
+            "\u4f46\u5019\u9009\u7a0e\u53f7\u4e0d\u5728\u5f53\u524d\u6613\u4ee3\u8d26\u4f01\u4e1a\uff0c\u65e0\u6cd5\u5728\u5f53\u524d\u4f01\u4e1a\u5237\u65b0\u6210\u65b0 taskId\u3002"
+        )
+    if status == "backend_candidates_only":
+        return (
+            f"\u540e\u53f0\u6709 {backend_candidate_count} \u4e2a\u5386\u53f2\u5019\u9009\uff0c"
+            "\u4f46\u672a\u83b7\u5f97\u53ef\u7528\u7684\u6613\u4ee3\u8d26\u65b0\u53d6\u6570\u6765\u6e90\u3002"
+        )
+    if status == "backend_no_usable_candidate":
+        return "\u540e\u53f0\u67e5\u5230\u5386\u53f2\u4efb\u52a1\uff0c\u4f46\u6ca1\u6709\u7b26\u5408\u8be5\u7f3a\u53e3\u7684\u53ef\u7528\u5019\u9009\u3002"
+    return "\u672a\u786e\u8ba4\u5230\u53ef\u7528\u6837\u672c\u6765\u6e90\u3002"
+
+
+def supplement_source_readiness_next_action(status: str) -> str:
+    actions = {
+        "fresh_task_ready": "\u7ee7\u7eed\u4f7f\u7528\u65b0 taskId \u8dd1\u6807\u51c6\u9a8c\u8bc1\u3002",
+        "other_enterprise_has_cit_signal": "\u5207\u6362\u5230\u63d0\u793a\u7684\u6613\u4ee3\u8d26\u4f01\u4e1a\uff0c\u6216\u4f7f\u7528\u6307\u5b9a work.html URL \u91cd\u8bd5 CIT A \u8865\u9f50\u5237\u65b0\u3002",
+        "other_enterprise_scan_login_required": "\u901a\u8fc7\u5de5\u4f5c\u53f0\u4e34\u65f6\u586b\u5165\u6613\u4ee3\u8d26\u8d26\u53f7\u5bc6\u7801\uff0c\u6216\u5728\u7ec8\u7aef\u8bbe\u7f6e YDZ_USERNAME/YDZ_PASSWORD \u540e\u91cd\u8bd5\u4f01\u4e1a\u626b\u63cf\u3002",
+        "other_enterprise_scan_unavailable": "\u624b\u5de5\u786e\u8ba4\u76ee\u6807\u4f01\u4e1a\u7684\u6613\u4ee3\u8d26\u5e94\u7528\u662f\u5426\u5df2\u5f00\u901a\uff1b\u82e5\u5df2\u5f00\u901a\uff0c\u63d0\u4f9b\u5176 work.html URL\uff0c\u6216\u5728\u5171\u4eab\u6d4f\u89c8\u5668\u624b\u5de5\u6253\u5f00\u8be5 work.html \u6807\u7b7e\u9875\u540e\u91cd\u8bd5\u3002",
+        "ydz_login_required": "\u901a\u8fc7\u5de5\u4f5c\u53f0\u4e34\u65f6\u586b\u5165\u6613\u4ee3\u8d26\u8d26\u53f7\u5bc6\u7801\uff0c\u6216\u624b\u5de5\u91cd\u65b0\u767b\u5f55\u6613\u4ee3\u8d26\u540e\u91cd\u8bd5\u8865\u9f50\u5237\u65b0\u3002",
+        "ydz_no_need_collect": "\u66f4\u6362\u5019\u9009\u7a0e\u53f7\u6216\u6240\u5c5e\u671f\uff0c\u4f18\u5148\u9009\u62e9\u4f1a\u751f\u6210\u4f01\u4e1a\u6240\u5f97\u7a0e A \u7c7b\u53d6\u6570 taskId \u7684\u6837\u672c\u3002",
+        "current_enterprise_no_cit_signal": "\u5207\u6362\u5230\u6709\u4f01\u4e1a\u6240\u5f97\u7a0e A \u7c7b\u8d26\u5957\u7684\u6613\u4ee3\u8d26\u4f01\u4e1a\uff0c\u6216\u5148\u521b\u5efa/\u5bfc\u5165\u8be5\u7c7b\u8d26\u5957\u518d\u53d6\u6570\u3002",
+        "other_enterprise_no_cit_signal": "\u5148\u521b\u5efa/\u5bfc\u5165\u4e00\u4e2a\u4f01\u4e1a\u6240\u5f97\u7a0e A \u7c7b\u8d26\u5957\uff0c\u6216\u6269\u5927\u53ef\u9009\u4f01\u4e1a\u540e\u91cd\u65b0\u626b\u63cf\u3002",
+        "backend_candidates_not_refreshable": "\u5207\u6362\u5230\u5305\u542b\u5019\u9009\u7a0e\u53f7\u7684\u6613\u4ee3\u8d26\u4f01\u4e1a\uff0c\u6216\u5148\u5efa\u8d26\u5957\u540e\u91cd\u65b0\u53d6\u6570\u3002",
+        "backend_candidates_only": "\u4f18\u5148\u5237\u65b0\u6210\u5f53\u524d\u6613\u4ee3\u8d26\u4f01\u4e1a\u7684\u65b0\u53d6\u6570 taskId\uff0c\u5386\u53f2 taskId \u53ef\u80fd\u7a0e\u5c40\u767b\u5f55\u6001\u5df2\u8fc7\u671f\u3002",
+        "backend_no_usable_candidate": "\u6269\u5927\u5019\u9009\u6765\u6e90\u6216\u5148\u5236\u9020\u4e00\u4e2a\u53ef\u7528\u6837\u672c\uff0c\u518d\u8fd0\u884c\u8865\u9f50\u3002",
+    }
+    return actions.get(status, "\u9700\u8981\u4eba\u5de5\u786e\u8ba4\u6837\u672c\u6765\u6e90\u3002")
+
+
+def ydz_enterprise_scan_suggestions(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    suggestions: list[dict[str, Any]] = []
+    for record in records or []:
+        if str(record.get("source") or "") not in YDZ_EXTERNAL_ACCOUNT_SCAN_SOURCES:
+            continue
+        cit_signal_count = max_int_field([record], "citSignalCount")
+        if cit_signal_count <= 0:
+            continue
+        suggestions.append(
+            {
+                "enterprise": str(record.get("enterprise") or ""),
+                "accountCount": max_int_field([record], "accountCount"),
+                "citSignalCount": cit_signal_count,
+                "sampleTaxNos": [
+                    str(item)
+                    for item in (record.get("sampleTaxNos") or [])
+                    if str(item or "")
+                ][:5],
+            }
+        )
+    return suggestions
+
+
+def first_ydz_enterprise_scan_error(records: list[dict[str, Any]]) -> str:
+    for record in records or []:
+        if str(record.get("source") or "") != "other_enterprise_selector_scan":
+            continue
+        reason = str(record.get("reason") or "").strip()
+        if reason:
+            return reason
+    for record in records or []:
+        if str(record.get("source") or "") not in YDZ_EXTERNAL_ACCOUNT_SCAN_SOURCES:
+            continue
+        if str(record.get("status") or "") != "failed":
+            continue
+        reason = str(record.get("reason") or "").strip()
+        if reason:
+            return reason
+    return ""
+
+
+def is_ydz_enterprise_scan_login_required(record: dict[str, Any]) -> bool:
+    source = str(record.get("source") or "")
+    reason = str(record.get("reason") or "")
+    if source not in {"other_enterprise_selector_scan", *YDZ_EXTERNAL_ACCOUNT_SCAN_SOURCES}:
+        return False
+    return is_ydz_login_required_reason(reason)
+
+
+def is_ydz_login_required_reason(reason: str) -> bool:
+    return (
+        "YDZ_USERNAME" in reason
+        or "YDZ_PASSWORD" in reason
+        or "\u767b\u5f55\u6001\u7f3a\u5931" in reason
+        or "\u51ed\u636e" in reason
+        or "\u9a8c\u8bc1\u7801" in reason
+        or "\u624b\u5de5\u786e\u8ba4" in reason
+        or "\u672a\u8fdb\u5165\u4f01\u4e1a\u9009\u62e9" in reason
+        or "Could not locate Yidaizhang login inputs" in reason
+        or "Yidaizhang login token is missing" in reason
+        or "API token is missing" in reason
+        or "http=701" in reason
+        or "token \u4e0d\u80fd\u4e3a\u7a7a" in reason
+    )
+
+
+def max_int_field(records: list[dict[str, Any]], field: str) -> int:
+    result = 0
+    for record in records or []:
+        try:
+            result = max(result, int(record.get(field) or 0))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def refresh_cit_supplement_candidates_from_ydz(
+    args: argparse.Namespace,
+    grouped_candidates: dict[str, list[Any]],
+    max_candidates: int,
+) -> tuple[dict[str, list[Any]], list[dict[str, Any]]]:
+    cit_targets = {
+        target_key: candidates
+        for target_key, candidates in grouped_candidates.items()
+        if str(target_key).startswith("CIT_A:") and candidates
+    }
+    if not cit_targets:
+        return grouped_candidates, []
+
+    records: list[dict[str, Any]] = []
+    refreshed: dict[str, list[Any]] = {key: list(values) for key, values in grouped_candidates.items()}
+    try:
+        with open_ydz_session(
+            args,
+            {"kind": "coverage-supplement-cit-refresh", "targets": sorted(cit_targets)},
+        ) as (session, resolver, collector):
+            enterprise_scan_cache: list[dict[str, Any]] | None = None
+            cit_collector = YdzCollector(
+                api=collector.api,
+                enterprise=collector.enterprise,
+                query_area_code=collector.query_area_code,
+                tax_type_ids=CIT_A_YDZ_TAX_TYPE_IDS,
+                poll_interval=collector.poll_interval,
+                poll_timeout=collector.poll_timeout,
+            )
+            for target_key, candidates in cit_targets.items():
+                fresh_candidates: list[Any] = []
+                for candidate in candidates:
+                    if not str(getattr(candidate, "tax_no", "") or ""):
+                        continue
+                    if fresh_candidates:
+                        break
+                    record, new_candidates = refresh_one_supplement_candidate_from_ydz(
+                        args=args,
+                        collector=cit_collector,
+                        resolver=resolver,
+                        candidate=candidate,
+                    )
+                    records.append(record)
+                    fresh_candidates.extend(new_candidates)
+                if not fresh_candidates:
+                    scan_records, scan_candidates = refresh_current_enterprise_cit_candidates_from_ydz(
+                        args=args,
+                        collector=cit_collector,
+                        resolver=resolver,
+                        template=candidates[0],
+                        original_candidates=candidates,
+                        max_candidates=max_candidates,
+                    )
+                    records.extend(scan_records)
+                    fresh_candidates.extend(scan_candidates)
+                if not fresh_candidates and explicit_ydz_work_urls(args):
+                    scan_records, scan_candidates = refresh_explicit_ydz_work_url_cit_candidates_from_ydz(
+                        args=args,
+                        session=session,
+                        resolver=resolver,
+                        template=candidates[0],
+                        original_candidates=candidates,
+                        current_enterprise=collector.enterprise,
+                        max_candidates=max_candidates,
+                    )
+                    records.extend(scan_records)
+                    fresh_candidates.extend(scan_candidates)
+                if (
+                    not fresh_candidates
+                    and bool(getattr(args, "coverage_supplement_scan_ydz_enterprises", False))
+                ):
+                    current_work_url = ""
+                    try:
+                        current_work_url = str(getattr(collector.api.page, "url", "") or "")
+                    except Exception:
+                        current_work_url = ""
+                    open_tab_records, open_tab_candidates = refresh_open_ydz_work_tab_cit_candidates_from_ydz(
+                        args=args,
+                        session=session,
+                        resolver=resolver,
+                        template=candidates[0],
+                        current_enterprise=collector.enterprise,
+                        max_candidates=max_candidates,
+                        exclude_urls={current_work_url} if current_work_url else set(),
+                    )
+                    records.extend(open_tab_records)
+                    fresh_candidates.extend(open_tab_candidates)
+                if (
+                    not fresh_candidates
+                    and bool(getattr(args, "coverage_supplement_scan_ydz_enterprises", False))
+                ):
+                    if enterprise_scan_cache is None:
+                        enterprise_scan_cache = scan_other_ydz_enterprises_for_cit_accounts(
+                            args=args,
+                            session=session,
+                            target_key=target_key,
+                            current_enterprise=collector.enterprise,
+                        )
+                        enterprise_records = enterprise_scan_cache
+                    else:
+                        enterprise_records = retarget_ydz_enterprise_scan_records(
+                            enterprise_scan_cache,
+                            target_key=target_key,
+                        )
+                    records.extend(enterprise_records)
+                if fresh_candidates:
+                    refreshed[target_key] = merge_fresh_supplement_candidates(
+                        fresh_candidates=fresh_candidates,
+                        original_candidates=refreshed.get(target_key) or [],
+                        max_candidates=max_candidates,
+                    )
+    except Exception as exc:
+        records.append(
+            {
+                "targetKey": ",".join(sorted(cit_targets)),
+                "status": "failed",
+                "reason": friendly_collect_exception(exc),
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+    return refreshed, records
+
+
+def refresh_current_enterprise_cit_candidates_from_ydz(
+    args: argparse.Namespace,
+    collector: YdzCollector,
+    resolver: VerifyTaskResolver,
+    template: Any,
+    original_candidates: list[Any],
+    max_candidates: int,
+) -> tuple[list[dict[str, Any]], list[SupplementCandidate]]:
+    target_key = str(getattr(template, "target_key", "") or "")
+    periods = ydz_cit_refresh_periods(args, template, original_candidates)
+    records: list[dict[str, Any]] = []
+    fresh_candidates: list[SupplementCandidate] = []
+    tried_accounts: set[tuple[str, str]] = set()
+    original_tax_nos = {
+        str(getattr(candidate, "tax_no", "") or "")
+        for candidate in original_candidates
+        if str(getattr(candidate, "tax_no", "") or "")
+    }
+    attempt_limit = max(1, int(max_candidates or 1))
+    attempts = 0
+    for period in periods:
+        if attempts >= attempt_limit or fresh_candidates:
+            break
+        try:
+            accounts = collector.list_accounts(
+                period=period,
+                page_size=CIT_A_YDZ_ACCOUNT_SCAN_PAGE_SIZE,
+                max_pages=CIT_A_YDZ_ACCOUNT_SCAN_MAX_PAGES,
+            )
+        except Exception as exc:
+            records.append(
+                {
+                    "targetKey": target_key,
+                    "period": period,
+                    "status": "failed",
+                    "reason": friendly_collect_exception(exc),
+                    "source": "current_enterprise_account_scan",
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            continue
+
+        sorted_accounts = [
+            account for account in sort_current_enterprise_cit_accounts(accounts) if account_has_cit_signal(account)
+        ]
+        cit_signal_count = len(sorted_accounts)
+        records.append(
+            {
+                "targetKey": target_key,
+                "period": period,
+                "status": "account_scan",
+                "reason": "current_enterprise_account_scan",
+                "source": "current_enterprise_account_scan",
+                "accountCount": len(accounts),
+                "citSignalCount": cit_signal_count,
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        if not sorted_accounts:
+            records.append(
+                {
+                    "targetKey": target_key,
+                    "period": period,
+                    "status": "skipped",
+                    "reason": "current_enterprise_scan_no_cit_account_signal",
+                    "source": "current_enterprise_account_scan",
+                    "accountCount": len(accounts),
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            continue
+        for account in sorted_accounts:
+            if attempts >= attempt_limit or fresh_candidates:
+                break
+            if account.tax_no in original_tax_nos:
+                continue
+            key = (account.tax_no, period)
+            if key in tried_accounts:
+                continue
+            tried_accounts.add(key)
+            attempts += 1
+            record, new_candidates = refresh_one_current_enterprise_cit_account_from_ydz(
+                args=args,
+                collector=collector,
+                resolver=resolver,
+                template=template,
+                account=account,
+                period=period,
+            )
+            records.append(record)
+            fresh_candidates.extend(new_candidates)
+    if not fresh_candidates:
+        records.append(
+            {
+                "targetKey": target_key,
+                "status": "skipped",
+                "reason": "current_enterprise_scan_no_fresh_task_id",
+                "source": "current_enterprise_account_scan",
+                "periods": periods,
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+    return records, fresh_candidates
+
+
+def scan_other_ydz_enterprises_for_cit_accounts(
+    args: argparse.Namespace,
+    session: YdzSession,
+    target_key: str,
+    current_enterprise: str,
+) -> list[dict[str, Any]]:
+    username, password = get_env_credentials()
+    period = normalize_period_yyyymm(str(getattr(args, "period", "") or "")) or str(getattr(args, "period", "") or "")
+    limit = max(1, int(getattr(args, "coverage_supplement_ydz_enterprise_scan_limit", 8) or 8))
+    explicit_names = [
+        name.strip()
+        for name in str(getattr(args, "coverage_supplement_ydz_enterprise_names", "") or "").split(",")
+        if name.strip()
+    ]
+    records: list[dict[str, Any]] = []
+    try:
+        detected_names = session.list_enterprises(username=username, password=password, limit=limit + len(explicit_names) + 1)
+    except Exception as exc:
+        detected_names = []
+        records.append(
+            {
+                "targetKey": target_key,
+                "period": period,
+                "status": "failed",
+                "reason": friendly_collect_exception(exc),
+                "source": "other_enterprise_selector_scan",
+                "currentEnterprise": current_enterprise,
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+
+    enterprises = [
+        name
+        for name in unique_texts(explicit_names + detected_names)
+        if name and not same_ydz_enterprise_name(name, current_enterprise)
+    ][:limit]
+    if not enterprises:
+        records.append(
+            {
+                "targetKey": target_key,
+                "period": period,
+                "status": "skipped",
+                "reason": "other_enterprise_scan_no_selectable_enterprises",
+                "source": "other_enterprise_account_scan",
+                "currentEnterprise": current_enterprise,
+                "enterpriseScanCount": 0,
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        return records
+
+    for enterprise in enterprises:
+        try:
+            page = session.switch_enterprise(username=username, password=password, enterprise=enterprise)
+            api = YdzApi(page)
+            collector = YdzCollector(
+                api=api,
+                enterprise=enterprise,
+                tax_type_ids=CIT_A_YDZ_TAX_TYPE_IDS,
+                poll_interval=int(getattr(args, "poll_interval", 15) or 15),
+                poll_timeout=int(getattr(args, "poll_timeout", 600) or 600),
+            )
+            accounts = collector.list_accounts(
+                period=period,
+                page_size=CIT_A_YDZ_ACCOUNT_SCAN_PAGE_SIZE,
+                max_pages=CIT_A_YDZ_ACCOUNT_SCAN_MAX_PAGES,
+            )
+            cit_accounts = [
+                account for account in sort_current_enterprise_cit_accounts(accounts) if account_has_cit_signal(account)
+            ]
+            records.append(
+                {
+                    "targetKey": target_key,
+                    "period": period,
+                    "status": "account_scan",
+                    "reason": "other_enterprise_account_scan",
+                    "source": "other_enterprise_account_scan",
+                    "currentEnterprise": current_enterprise,
+                    "enterprise": enterprise,
+                    "accountCount": len(accounts),
+                    "citSignalCount": len(cit_accounts),
+                    "sampleTaxNos": [account.tax_no for account in cit_accounts[:5]],
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            if cit_accounts:
+                break
+        except Exception as exc:
+            records.append(
+                {
+                    "targetKey": target_key,
+                    "period": period,
+                    "status": "failed",
+                    "reason": friendly_collect_exception(exc),
+                    "source": "other_enterprise_account_scan",
+                    "currentEnterprise": current_enterprise,
+                    "enterprise": enterprise,
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+    return records
+
+
+def refresh_explicit_ydz_work_url_cit_candidates_from_ydz(
+    args: argparse.Namespace,
+    session: YdzSession,
+    resolver: VerifyTaskResolver,
+    template: Any,
+    original_candidates: list[Any],
+    current_enterprise: str,
+    max_candidates: int,
+) -> tuple[list[dict[str, Any]], list[SupplementCandidate]]:
+    target_key = str(getattr(template, "target_key", "") or "")
+    period = normalize_period_yyyymm(str(getattr(args, "period", "") or "")) or str(getattr(args, "period", "") or "")
+    urls = explicit_ydz_work_urls(args)
+    records: list[dict[str, Any]] = []
+    fresh_candidates: list[SupplementCandidate] = []
+    if not urls:
+        return records, fresh_candidates
+
+    attempted_accounts: set[tuple[str, str]] = set()
+    attempt_limit = max(1, int(max_candidates or 1))
+    attempts = 0
+
+    for work_url in urls:
+        if attempts >= attempt_limit or fresh_candidates:
+            break
+        label = redact_ydz_work_url_label(work_url)
+        try:
+            page = session.open_work_url(work_url)
+            collector = YdzCollector(
+                api=YdzApi(page),
+                enterprise=label,
+                tax_type_ids=CIT_A_YDZ_TAX_TYPE_IDS,
+                poll_interval=int(getattr(args, "poll_interval", 15) or 15),
+                poll_timeout=int(getattr(args, "poll_timeout", 600) or 600),
+            )
+            accounts = collector.list_accounts(
+                period=period,
+                page_size=CIT_A_YDZ_ACCOUNT_SCAN_PAGE_SIZE,
+                max_pages=CIT_A_YDZ_ACCOUNT_SCAN_MAX_PAGES,
+            )
+            cit_accounts = [
+                account for account in sort_current_enterprise_cit_accounts(accounts) if account_has_cit_signal(account)
+            ]
+            records.append(
+                {
+                    "targetKey": target_key,
+                    "period": period,
+                    "status": "account_scan",
+                    "reason": "explicit_work_url_account_scan",
+                    "source": "explicit_work_url_account_scan",
+                    "currentEnterprise": current_enterprise,
+                    "enterprise": label,
+                    "accountCount": len(accounts),
+                    "citSignalCount": len(cit_accounts),
+                    "sampleTaxNos": [account.tax_no for account in cit_accounts[:5]],
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            for account in cit_accounts:
+                if attempts >= attempt_limit or fresh_candidates:
+                    break
+                account_key = (account.tax_no, period)
+                if account_key in attempted_accounts:
+                    continue
+                attempted_accounts.add(account_key)
+                attempts += 1
+                record, new_candidates = refresh_one_current_enterprise_cit_account_from_ydz(
+                    args=args,
+                    collector=collector,
+                    resolver=resolver,
+                    template=template,
+                    account=account,
+                    period=period,
+                )
+                record.update(
+                    {
+                        "source": "explicit_work_url_account_scan",
+                        "currentEnterprise": current_enterprise,
+                        "enterprise": label,
+                    }
+                )
+                records.append(record)
+                fresh_candidates.extend(new_candidates)
+        except Exception as exc:
+            records.append(
+                {
+                    "targetKey": target_key,
+                    "period": period,
+                    "status": "failed",
+                    "reason": friendly_collect_exception(exc),
+                    "source": "explicit_work_url_account_scan",
+                    "currentEnterprise": current_enterprise,
+                    "enterprise": label,
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+
+    if not fresh_candidates:
+        records.append(
+            {
+                "targetKey": target_key,
+                "period": period,
+                "status": "skipped",
+                "reason": "explicit_work_url_scan_no_fresh_task_id",
+                "source": "explicit_work_url_account_scan",
+                "currentEnterprise": current_enterprise,
+                "urlCount": len(urls),
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+    return records, fresh_candidates
+
+
+def refresh_open_ydz_work_tab_cit_candidates_from_ydz(
+    args: argparse.Namespace,
+    session: YdzSession,
+    resolver: VerifyTaskResolver,
+    template: Any,
+    current_enterprise: str,
+    max_candidates: int,
+    exclude_urls: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[SupplementCandidate]]:
+    target_key = str(getattr(template, "target_key", "") or "")
+    period = normalize_period_yyyymm(str(getattr(args, "period", "") or "")) or str(getattr(args, "period", "") or "")
+    records: list[dict[str, Any]] = []
+    fresh_candidates: list[SupplementCandidate] = []
+    pages = session.ready_open_work_pages(exclude_urls=exclude_urls or set())
+    if not pages:
+        records.append(
+            {
+                "targetKey": target_key,
+                "period": period,
+                "status": "skipped",
+                "reason": "open_work_tab_scan_no_ready_pages",
+                "source": "open_work_tab_scan",
+                "currentEnterprise": current_enterprise,
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        return records, fresh_candidates
+
+    attempted_accounts: set[tuple[str, str]] = set()
+    attempt_limit = max(1, int(max_candidates or 1))
+    attempts = 0
+    for page in pages:
+        if attempts >= attempt_limit or fresh_candidates:
+            break
+        try:
+            label = redact_ydz_work_url_label(str(getattr(page, "url", "") or ""))
+        except Exception:
+            label = "open-ydz-work-tab"
+        try:
+            collector = YdzCollector(
+                api=YdzApi(page),
+                enterprise=label,
+                tax_type_ids=CIT_A_YDZ_TAX_TYPE_IDS,
+                poll_interval=int(getattr(args, "poll_interval", 15) or 15),
+                poll_timeout=int(getattr(args, "poll_timeout", 600) or 600),
+            )
+            accounts = collector.list_accounts(
+                period=period,
+                page_size=CIT_A_YDZ_ACCOUNT_SCAN_PAGE_SIZE,
+                max_pages=CIT_A_YDZ_ACCOUNT_SCAN_MAX_PAGES,
+            )
+            cit_accounts = [
+                account for account in sort_current_enterprise_cit_accounts(accounts) if account_has_cit_signal(account)
+            ]
+            records.append(
+                {
+                    "targetKey": target_key,
+                    "period": period,
+                    "status": "account_scan",
+                    "reason": "open_work_tab_account_scan",
+                    "source": "open_work_tab_account_scan",
+                    "currentEnterprise": current_enterprise,
+                    "enterprise": label,
+                    "accountCount": len(accounts),
+                    "citSignalCount": len(cit_accounts),
+                    "sampleTaxNos": [account.tax_no for account in cit_accounts[:5]],
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            for account in cit_accounts:
+                if attempts >= attempt_limit or fresh_candidates:
+                    break
+                account_key = (account.tax_no, period)
+                if account_key in attempted_accounts:
+                    continue
+                attempted_accounts.add(account_key)
+                attempts += 1
+                record, new_candidates = refresh_one_current_enterprise_cit_account_from_ydz(
+                    args=args,
+                    collector=collector,
+                    resolver=resolver,
+                    template=template,
+                    account=account,
+                    period=period,
+                )
+                record.update(
+                    {
+                        "source": "open_work_tab_account_scan",
+                        "currentEnterprise": current_enterprise,
+                        "enterprise": label,
+                    }
+                )
+                records.append(record)
+                fresh_candidates.extend(new_candidates)
+        except Exception as exc:
+            records.append(
+                {
+                    "targetKey": target_key,
+                    "period": period,
+                    "status": "failed",
+                    "reason": friendly_collect_exception(exc),
+                    "source": "open_work_tab_account_scan",
+                    "currentEnterprise": current_enterprise,
+                    "enterprise": label,
+                    "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+
+    if not fresh_candidates:
+        records.append(
+            {
+                "targetKey": target_key,
+                "period": period,
+                "status": "skipped",
+                "reason": "open_work_tab_scan_no_fresh_task_id",
+                "source": "open_work_tab_account_scan",
+                "currentEnterprise": current_enterprise,
+                "tabCount": len(pages),
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+    return records, fresh_candidates
+
+
+def same_ydz_enterprise_name(name: str, current_enterprise: str) -> bool:
+    left = "".join(str(name or "").split())
+    right = "".join(str(current_enterprise or "").split())
+    if not left or not right:
+        return False
+    return left == right or left.startswith(right) or right.startswith(left)
+
+
+def retarget_ydz_enterprise_scan_records(records: list[dict[str, Any]], target_key: str) -> list[dict[str, Any]]:
+    retargeted: list[dict[str, Any]] = []
+    for record in records or []:
+        copied = dict(record)
+        copied["targetKey"] = target_key
+        retargeted.append(copied)
+    return retargeted
+
+
+def ydz_cit_refresh_periods(args: argparse.Namespace, template: Any, original_candidates: list[Any]) -> list[str]:
+    values: list[str] = []
+    values.append(str(getattr(args, "period", "") or ""))
+    for candidate in original_candidates:
+        values.append(str(getattr(candidate, "period", "") or ""))
+    values.append(str(getattr(template, "period", "") or ""))
+    periods = [normalize_period_yyyymm(value) for value in values]
+    return unique_texts([period for period in periods if period])[:CIT_A_YDZ_ACCOUNT_SCAN_MAX_PERIODS]
+
+
+def sort_current_enterprise_cit_accounts(accounts: list[YdzAccount]) -> list[YdzAccount]:
+    return sorted(
+        accounts,
+        key=lambda account: (
+            0 if account_has_cit_signal(account) else 1,
+            0 if str(account.auth_status or "") in {"", "AUTHORIZED"} else 1,
+            str(account.tax_no or ""),
+        ),
+    )
+
+
+def account_has_cit_signal(account: YdzAccount) -> bool:
+    for detail in (account.raw or {}).get("taxItemDetailList") or []:
+        try:
+            tax_type_id = int(detail.get("taxTypeId"))
+        except (TypeError, ValueError):
+            tax_type_id = None
+        text = " ".join(
+            str(detail.get(key) or "")
+            for key in ("taxTypeName", "taxName", "name", "message", "initStatusEnum")
+        )
+        if tax_type_id == 2 or "\u4f01\u4e1a\u6240\u5f97\u7a0e" in text:
+            return True
+    return False
+
+
+def refresh_one_current_enterprise_cit_account_from_ydz(
+    args: argparse.Namespace,
+    collector: YdzCollector,
+    resolver: VerifyTaskResolver,
+    template: Any,
+    account: YdzAccount,
+    period: str,
+) -> tuple[dict[str, Any], list[SupplementCandidate]]:
+    target_key = str(getattr(template, "target_key", "") or "")
+    record = {
+        "targetKey": target_key,
+        "sourceTaskId": str(getattr(template, "task_id", "") or ""),
+        "taxNo": account.tax_no,
+        "period": period,
+        "status": "checking",
+        "reason": "current_enterprise_account_scan",
+        "source": "current_enterprise_account_scan",
+        "taskIds": [],
+        "updatedAt": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        result = collector.submit_collect_tax_no(tax_no=account.tax_no, period=period, force=True)
+        poll_fresh_supplement_collect_result(collector, result, args)
+        if is_result_ready_for_task_resolution(result) or result.submitted:
+            resolver.resolve_all(result.tax_no, result.period, submitted_at=result.submitted_at)
+            apply_resolved_tasks_to_result(resolver, result)
+    except Exception as exc:
+        record.update({"status": "failed", "reason": friendly_collect_exception(exc)})
+        return record, []
+
+    record.update(
+        {
+            "collectStatus": result.status,
+            "manualRequired": result.manual_required,
+            "warnings": list(result.warnings or [])[:3],
+            "errors": list(result.errors or [])[:3],
+            "taxItems": list(result.tax_items or [])[:5],
+        }
+    )
+    task_ids = result_task_ids(result)
+    record["taskIds"] = task_ids
+    if not task_ids:
+        if str(result.status or "").upper() == "NO_NEED_COLLECTED":
+            reason = no_need_collect_reason(result.to_dict())
+        else:
+            reason = collect_failure_reason(result.to_dict()) or "fresh_ydz_collect_no_task_id"
+        record.update({"status": "failed", "reason": reason})
+        return record, []
+
+    created_by_task_id = {
+        str(task.task_id): task.created_stamp
+        for task in getattr(resolver, "last_tasks", []) or []
+        if getattr(task, "task_id", None)
+    }
+    fresh_candidates = [
+        clone_supplement_candidate_with_account_task(
+            template,
+            account=account,
+            task_id=task_id,
+            period=period,
+            created_stamp=created_by_task_id.get(str(task_id)),
+        )
+        for task_id in task_ids
+    ]
+    record.update({"status": "resolved", "reason": "fresh_ydz_collect_task_resolved"})
+    return record, fresh_candidates
+
+
+def refresh_one_supplement_candidate_from_ydz(
+    args: argparse.Namespace,
+    collector: YdzCollector,
+    resolver: VerifyTaskResolver,
+    candidate: Any,
+) -> tuple[dict[str, Any], list[SupplementCandidate]]:
+    target_key = str(getattr(candidate, "target_key", "") or "")
+    tax_no = str(getattr(candidate, "tax_no", "") or "")
+    if target_key.startswith("CIT_A:"):
+        period = normalize_period_yyyymm(str(getattr(args, "period", "") or "")) or str(
+            getattr(args, "period", "") or ""
+        )
+    else:
+        period = str(getattr(candidate, "period", "") or getattr(args, "period", "") or "")
+    record = {
+        "targetKey": target_key,
+        "sourceTaskId": str(getattr(candidate, "task_id", "") or ""),
+        "taxNo": tax_no,
+        "period": period,
+        "status": "checking",
+        "reason": "",
+        "taskIds": [],
+        "updatedAt": datetime.now().isoformat(timespec="seconds"),
+    }
+    if not tax_no or not period:
+        record.update({"status": "skipped", "reason": "candidate_missing_tax_no_or_period"})
+        return record, []
+
+    account = collector.find_account(tax_no, period)
+    if account is None:
+        record.update({"status": "skipped", "reason": "no_ydz_account_in_current_enterprise"})
+        return record, []
+
+    try:
+        result = collector.submit_collect_tax_no(tax_no=tax_no, period=period, force=True)
+        poll_fresh_supplement_collect_result(collector, result, args)
+        if is_result_ready_for_task_resolution(result) or result.submitted:
+            resolver.resolve_all(result.tax_no, result.period, submitted_at=result.submitted_at)
+            apply_resolved_tasks_to_result(resolver, result)
+    except Exception as exc:
+        record.update({"status": "failed", "reason": friendly_collect_exception(exc)})
+        return record, []
+
+    record.update(
+        {
+            "collectStatus": result.status,
+            "manualRequired": result.manual_required,
+            "warnings": list(result.warnings or [])[:3],
+            "errors": list(result.errors or [])[:3],
+            "taxItems": list(result.tax_items or [])[:5],
+        }
+    )
+    task_ids = result_task_ids(result)
+    record["taskIds"] = task_ids
+    if not task_ids:
+        if str(result.status or "").upper() == "NO_NEED_COLLECTED":
+            reason = no_need_collect_reason(result.to_dict())
+        else:
+            reason = collect_failure_reason(result.to_dict()) or "fresh_ydz_collect_no_task_id"
+        record.update({"status": "failed", "reason": reason})
+        return record, []
+
+    created_by_task_id = {
+        str(task.task_id): task.created_stamp
+        for task in getattr(resolver, "last_tasks", []) or []
+        if getattr(task, "task_id", None)
+    }
+    fresh_candidates = [
+        clone_supplement_candidate_with_task(
+            candidate,
+            task_id=task_id,
+            period=result.period,
+            created_stamp=created_by_task_id.get(str(task_id)),
+        )
+        for task_id in task_ids
+    ]
+    record.update({"status": "resolved", "reason": "fresh_ydz_collect_task_resolved"})
+    return record, fresh_candidates
+
+
+def poll_fresh_supplement_collect_result(
+    collector: YdzCollector,
+    result: YdzCollectResult,
+    args: argparse.Namespace,
+) -> None:
+    if not result.submitted or result.terminal or result.manual_required:
+        return
+    timeout = min(
+        max(1, int(getattr(args, "poll_timeout", 600) or 600)),
+        CIT_A_YDZ_REFRESH_POLL_TIMEOUT_SECONDS,
+    )
+    interval = max(1, int(getattr(args, "poll_interval", 15) or 15))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        collector.refresh_collect_status(result)
+        if result.terminal or result.manual_required or result.status in TERMINAL_COLLECT_STATUSES:
+            return
+        time.sleep(interval)
+    result.manual_required = True
+    result.errors.append(f"Timed out waiting for fresh supplement collection; last status={result.status}.")
+
+
+def clone_supplement_candidate_with_task(
+    candidate: Any,
+    task_id: str,
+    period: str,
+    created_stamp: int | None,
+) -> SupplementCandidate:
+    return SupplementCandidate(
+        target_key=str(getattr(candidate, "target_key", "") or ""),
+        tax_type=str(getattr(candidate, "tax_type", "") or ""),
+        tax_type_name=str(getattr(candidate, "tax_type_name", "") or ""),
+        declaration_status=str(getattr(candidate, "declaration_status", "") or ""),
+        declaration_status_name=str(getattr(candidate, "declaration_status_name", "") or ""),
+        task_id=str(task_id),
+        tax_no=str(getattr(candidate, "tax_no", "") or ""),
+        period=period or str(getattr(candidate, "period", "") or ""),
+        task_status="SUCCESS",
+        backend_tax_type_id=str(getattr(candidate, "backend_tax_type_id", "") or ""),
+        backend_tax_id=str(getattr(candidate, "backend_tax_id", "") or ""),
+        backend_query_field=str(getattr(candidate, "backend_query_field", "") or ""),
+        created_stamp=created_stamp if created_stamp is not None else int(time.time() * 1000),
+        parse_status=str(getattr(candidate, "parse_status", "") or ""),
+        reason="fresh_ydz_collect",
+    )
+
+
+def clone_supplement_candidate_with_account_task(
+    candidate: Any,
+    account: YdzAccount,
+    task_id: str,
+    period: str,
+    created_stamp: int | None,
+) -> SupplementCandidate:
+    return SupplementCandidate(
+        target_key=str(getattr(candidate, "target_key", "") or ""),
+        tax_type=str(getattr(candidate, "tax_type", "") or ""),
+        tax_type_name=str(getattr(candidate, "tax_type_name", "") or ""),
+        declaration_status=str(getattr(candidate, "declaration_status", "") or ""),
+        declaration_status_name=str(getattr(candidate, "declaration_status_name", "") or ""),
+        task_id=str(task_id),
+        tax_no=str(account.tax_no or ""),
+        period=period or str(getattr(candidate, "period", "") or ""),
+        task_status="SUCCESS",
+        backend_tax_type_id=str(getattr(candidate, "backend_tax_type_id", "") or ""),
+        backend_tax_id=str(getattr(candidate, "backend_tax_id", "") or ""),
+        backend_query_field=str(getattr(candidate, "backend_query_field", "") or ""),
+        created_stamp=created_stamp if created_stamp is not None else int(time.time() * 1000),
+        parse_status="unknown",
+        reason="fresh_ydz_collect",
+    )
+
+
+def merge_fresh_supplement_candidates(
+    fresh_candidates: list[Any],
+    original_candidates: list[Any],
+    max_candidates: int,
+) -> list[Any]:
+    merged: list[Any] = []
+    seen_task_ids: set[str] = set()
+    for candidate in [*fresh_candidates, *original_candidates]:
+        task_id = str(getattr(candidate, "task_id", "") or "")
+        if not task_id or task_id in seen_task_ids:
+            continue
+        seen_task_ids.add(task_id)
+        merged.append(candidate)
+    return sorted(merged, key=supplement_candidate_sort_key)[: max(1, int(max_candidates or 1))]
+
+
+def coverage_target_is_covered(coverage_payload: dict[str, Any], target_key: str) -> bool:
+    for target in coverage_payload.get("targets") or []:
+        if str(target.get("key") or "") == str(target_key) and bool(target.get("covered")):
+            return True
+    return False
+
+
+def supplement_verify_record_for_item(item: dict[str, Any], task_id: str = "") -> dict[str, Any]:
+    if task_id:
+        task_verify = task_verify_entry(item, task_id)
+        if task_verify:
+            return task_verify
+    verify = item.get("verify") or {}
+    return verify if isinstance(verify, dict) else {}
+
+
+def supplement_verify_record_is_clean(verify: dict[str, Any]) -> bool:
+    if not isinstance(verify, dict):
+        return False
+    if str(verify.get("status") or "") != "success":
+        return False
+    try:
+        return_code = int(verify.get("returnCode") or 0)
+    except (TypeError, ValueError):
+        return False
+    return return_code == 0
+
+
+def supplement_item_has_clean_verification(item: dict[str, Any], task_id: str = "") -> bool:
+    return supplement_verify_record_is_clean(supplement_verify_record_for_item(item, task_id))
+
+
+def supplement_remaining_missing_keys(missing_targets: list[Any], covered_keys: list[str]) -> list[str]:
+    covered = {str(key) for key in covered_keys}
+    return [
+        str(getattr(target, "key", "") or "")
+        for target in missing_targets
+        if str(getattr(target, "key", "") or "") not in covered
+    ]
+
+
+def build_supplement_attempt_record(
+    candidate: Any,
+    target: Any,
+    attempt_no: int,
+    total_candidates: int,
+    item_key: str,
+    status: str,
+    step: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "targetKey": str(getattr(target, "key", "") or getattr(candidate, "target_key", "") or ""),
+        "taxType": str(getattr(candidate, "tax_type", "") or getattr(target, "tax_type", "") or ""),
+        "taxTypeName": str(getattr(candidate, "tax_type_name", "") or getattr(target, "tax_type_name", "") or ""),
+        "declarationStatus": str(
+            getattr(candidate, "declaration_status", "") or getattr(target, "declaration_status", "") or ""
+        ),
+        "declarationStatusName": str(
+            getattr(candidate, "declaration_status_name", "")
+            or getattr(target, "declaration_status_name", "")
+            or ""
+        ),
+        "taskId": str(getattr(candidate, "task_id", "") or ""),
+        "taxNo": str(getattr(candidate, "tax_no", "") or ""),
+        "period": str(getattr(candidate, "period", "") or ""),
+        "backendTaxTypeId": str(getattr(candidate, "backend_tax_type_id", "") or ""),
+        "backendTaxId": str(getattr(candidate, "backend_tax_id", "") or ""),
+        "backendQueryField": str(getattr(candidate, "backend_query_field", "") or ""),
+        "parseStatus": str(getattr(candidate, "parse_status", "") or ""),
+        "candidateReason": str(getattr(candidate, "reason", "") or ""),
+        "itemKey": item_key,
+        "attemptNo": attempt_no,
+        "totalCandidates": total_candidates,
+        "status": status,
+        "step": step,
+        "reason": normalize_supplement_failure_reason(reason),
+        "updatedAt": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def update_supplement_attempt_record(
+    attempt: dict[str, Any],
+    item: dict[str, Any],
+    covered: bool,
+    task_id: str = "",
+    matrix_covered: bool = False,
+) -> None:
+    verify = supplement_verify_record_for_item(item, task_id)
+    reason = verify.get("reason") or item.get("stageReason") or ""
+    verify_status = str(verify.get("status") or "")
+    if covered:
+        attempt.update(
+            {
+                "status": "covered",
+                "step": "覆盖成功",
+                "reason": "该候选任务已生成有效报告并覆盖目标税种/申报状态。",
+            }
+        )
+    else:
+        if matrix_covered and not supplement_verify_record_is_clean(verify) and not reason:
+            reason = (
+                "Coverage matrix has an existing report for this target, "
+                "but the current supplement candidate did not verify successfully."
+            )
+        failure_category = classify_supplement_failure_category(reason)
+        failure_step = classify_supplement_failure_step(reason, verify_status)
+        failure_reason = normalize_supplement_failure_reason(reason or "验证后没有命中目标税种/申报状态。")
+        attempt.update(
+            {
+                "status": "failed",
+                "step": failure_step,
+                "failureCategory": failure_category,
+                "reason": failure_reason,
+            }
+        )
+    attempt.update(
+        {
+            "verifyStatus": verify_status,
+            "returnCode": verify.get("returnCode"),
+            "summaryPath": verify.get("summaryPath") or "",
+            "reportPaths": verify.get("reportPaths") or [],
+            "stdoutLog": verify.get("stdoutLog") or "",
+            "stderrLog": verify.get("stderrLog") or "",
+            "updatedAt": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+
+
+def is_tax_login_switch_limit_reason(reason: str) -> bool:
+    lower = str(reason or "").lower()
+    return (
+        "same-province" in lower
+        or "same province" in lower
+        or "switch limit" in lower
+        or ("wait" in lower and "1 hour" in lower)
+    )
+
+
+def classify_supplement_failure_step(reason: str, verify_status: str = "") -> str:
+    text = str(reason or "")
+    lower = text.lower()
+    if "undeclaredtaxalreadydeclarederror" in lower or "already declared" in lower:
+        return "税局现场状态冲突"
+    if "undeclaredtaxtargetunavailableerror" in lower or "undeclared tax target is unavailable" in lower:
+        return "查找未申报入口"
+    if (
+        "taxloginnotreadyerror" in lower
+        or "tax bureau login state or digital account authentication is not ready" in lower
+        or "getclientjob returned incomplete tax-login metadata" in lower
+        or "getclientjob returned a non-object response" in lower
+        or "getclientjob failed" in lower
+        or "getclientjob failed after retries" in lower
+        or "cannot resolve inner taskid from getclientjob response" in lower
+        or "cannot resolve province from getclientjob response" in lower
+        or "cannot resolve province from task cookie/client job data" in lower
+        or "gettaskcookie" in lower
+        or "declarationqueryautherror" in lower
+        or "tax bureau login timeout" in lower
+        or "login timeout" in lower
+        or "\u7a0e\u5c40\u767b\u5f55\u6001" in text
+        or "\u6570\u5b57\u8d26\u6237\u8ba4\u8bc1" in text
+        or "\u540c\u7701\u5207\u6362" in text
+        or "\u9891\u7e41\u5207\u6362" in text
+        or "\u7b49\u5f851\u5c0f\u65f6\u540e\u518d\u91cd\u8bd5" in text
+        or is_tax_login_switch_limit_reason(text)
+    ):
+        return "税局登录"
+    if "could not navigate to declaration query page" in lower or "/loading" in lower:
+        return "进入申报查询页"
+    if "declaration row was not found" in lower or "query returned no row" in lower:
+        return "查找申报记录"
+    if "target form" in lower or "confirm" in lower or "切换" in text:
+        return "切换/确认申报表"
+    if is_no_targets_verify_reason(text):
+        return "选择验证表单"
+    if verify_status == "completed_with_differences":
+        return "字段比对"
+    if verify_status == "skipped":
+        return "验证跳过"
+    return "验证任务"
+
+
+def classify_supplement_failure_category(reason: str) -> str:
+    text = str(reason or "")
+    lower = text.lower()
+    if "undeclaredtaxalreadydeclarederror" in lower or "already declared" in lower:
+        return "source_state_conflict"
+    if "declaration row was not found" in lower or "query returned no row" in lower or "未查询到目标申报记录" in text:
+        return "source_state_conflict"
+    if "undeclaredtaxtargetunavailableerror" in lower or "undeclared tax target is unavailable" in lower:
+        return "target_entry_unavailable"
+    if (
+        "pendingtaxloginjoberror" in lower
+        or "needforcetax" in lower
+        or "force-enter" in lower
+        or "\u540c\u7701\u5207\u6362" in text
+        or "\u9891\u7e41\u5207\u6362" in text
+        or "\u7b49\u5f851\u5c0f\u65f6\u540e\u518d\u91cd\u8bd5" in text
+        or ("\u7cfb\u7edf\u9650\u5236" in text and "1\u5c0f\u65f6" in text)
+        or is_tax_login_switch_limit_reason(text)
+    ):
+        return "tax_login_blocked"
+    if (
+        "getclientjob returned incomplete tax-login metadata" in lower
+        or "getclientjob returned a non-object response" in lower
+        or "getclientjob failed" in lower
+        or "getclientjob failed after retries" in lower
+        or "cannot resolve inner taskid from getclientjob response" in lower
+        or "cannot resolve province from getclientjob response" in lower
+        or "cannot resolve province from task cookie/client job data" in lower
+    ):
+        return "tax_login_expired"
+    if (
+        "declarationqueryautherror" in lower
+        or "taxloginnotreadyerror" in lower
+        or "tax bureau login state or digital account authentication is not ready" in lower
+        or "getclientjob returned incomplete tax-login metadata" in lower
+        or "getclientjob returned a non-object response" in lower
+        or "getclientjob failed" in lower
+        or "getclientjob failed after retries" in lower
+        or "cannot resolve inner taskid from getclientjob response" in lower
+        or "cannot resolve province from getclientjob response" in lower
+        or "cannot resolve province from task cookie/client job data" in lower
+        or "tpass." in lower
+        or "/loading" in lower
+        or "gettaskcookie" in lower
+        or "\u7a0e\u5c40\u767b\u5f55\u6001" in text
+        or "\u6570\u5b57\u8d26\u6237\u8ba4\u8bc1" in text
+        or "登录连接状态已失效" in text
+        or "重新发起任务" in text
+    ):
+        return "tax_login_expired"
+    if "timeout" in lower:
+        return "timeout"
+    return "verification_failed"
+
+
+def supplement_final_verify_exit_code(
+    verify_exit: int,
+    remaining_missing: list[str],
+    missing_targets: list[Any],
+    covered_keys: list[str],
+    attempts: list[dict[str, Any]],
+) -> int:
+    if not remaining_missing:
+        return 0
+    return verify_exit
+
+
+STABLE_SUPPLEMENT_EXCLUDE_CATEGORIES = {
+    "tax_login_expired",
+    "tax_login_blocked",
+    "source_state_conflict",
+    "target_entry_unavailable",
+}
+
+
+def supplement_excluded_task_ids_from_attempts(attempts: list[dict[str, Any]]) -> dict[str, set[str]]:
+    excluded: dict[str, set[str]] = {}
+    for attempt in attempts or []:
+        if not isinstance(attempt, dict):
+            continue
+        if str(attempt.get("status") or "") != "failed":
+            continue
+        target_key = str(attempt.get("targetKey") or "")
+        task_id = str(attempt.get("taskId") or "")
+        if not target_key or not task_id:
+            continue
+        category = str(attempt.get("failureCategory") or "")
+        if not category:
+            category = classify_supplement_failure_category(str(attempt.get("reason") or ""))
+        if category not in STABLE_SUPPLEMENT_EXCLUDE_CATEGORIES:
+            continue
+        excluded.setdefault(target_key, set()).add(task_id)
+    return excluded
+
+
+def supplement_excluded_task_ids_from_state(state: dict[str, Any]) -> dict[str, set[str]]:
+    excluded: dict[str, set[str]] = {}
+    supplement = state.get("coverageSupplement") if isinstance(state, dict) else {}
+    if isinstance(supplement, dict):
+        excluded = merge_excluded_task_id_maps(
+            excluded,
+            supplement_excluded_task_ids_from_preflight(supplement.get("loginPreflight") or []),
+        )
+
+    items = state.get("items") if isinstance(state, dict) else {}
+    if not isinstance(items, dict):
+        return excluded
+    for item in items.values():
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("source") or "") != "backend_supplement":
+            continue
+        target_keys: list[str] = [
+            str(value or "")
+            for value in (item.get("coverageSupplementTargets") or [])
+            if str(value or "")
+        ]
+        resolved = (item.get("collect") or {}).get("resolvedTask") or {}
+        resolved_target = str(resolved.get("coverageTarget") or "")
+        if resolved_target and resolved_target not in target_keys:
+            target_keys.append(resolved_target)
+        if not target_keys:
+            continue
+
+        verify_records: list[tuple[str, dict[str, Any]]] = []
+        verify_tasks = item.get("verifyTasks") or {}
+        if isinstance(verify_tasks, dict):
+            for task_id, verify in verify_tasks.items():
+                if isinstance(verify, dict):
+                    verify_records.append((str(task_id or ""), verify))
+        collect_task_id = str(((item.get("collect") or {}).get("verifyTaskId")) or "")
+        aggregate_verify = item.get("verify") or {}
+        if collect_task_id and isinstance(aggregate_verify, dict) and collect_task_id not in verify_tasks:
+            verify_records.append((collect_task_id, aggregate_verify))
+
+        for task_id, verify in verify_records:
+            if not task_id:
+                continue
+            if str(verify.get("status") or "") != "failed":
+                continue
+            category = classify_supplement_failure_category(str(verify.get("reason") or item.get("stageReason") or ""))
+            if category not in STABLE_SUPPLEMENT_EXCLUDE_CATEGORIES:
+                continue
+            for target_key in target_keys:
+                excluded.setdefault(target_key, set()).add(task_id)
+    return excluded
+
+
+def merge_excluded_task_id_maps(*maps: dict[str, set[str]]) -> dict[str, set[str]]:
+    merged: dict[str, set[str]] = {}
+    for mapping in maps:
+        for target_key, task_ids in (mapping or {}).items():
+            if not target_key:
+                continue
+            merged.setdefault(str(target_key), set()).update(str(task_id) for task_id in task_ids if str(task_id))
+    return merged
 
 
 def detect_cbj_task(task_id: str) -> str:
@@ -1439,6 +4823,7 @@ def cbj_browser_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         cdp_port=args.cdp_port,
         mode="auto",
+        chrome_path=args.chrome_path,
         user_data_dir=args.user_data_dir,
         plugin_path=args.plugin_path,
         chanjet_timeout=300,
@@ -1449,10 +4834,13 @@ def cbj_browser_args(args: argparse.Namespace) -> argparse.Namespace:
     )
 
 
-def resolve_cbj_mode(configured_mode: str, item: dict[str, Any]) -> str:
+def resolve_cbj_mode(configured_mode: str, item: dict[str, Any], task_id: str = "") -> str:
     if configured_mode != "auto":
         return configured_mode
     collect = item.get("collect") or {}
+    log_mode = resolve_cbj_mode_from_task_logs(task_id or item_cbj_task_id(item))
+    if log_mode:
+        return log_mode
     text_parts: list[str] = [str(item.get("taxNo") or "")]
     account = collect.get("account") or {}
     text_parts.append(str(account.get("custName") or ""))
@@ -1479,13 +4867,40 @@ def resolve_cbj_mode(configured_mode: str, item: dict[str, Any]) -> str:
     return "annual"
 
 
+def resolve_cbj_mode_from_task_logs(task_id: str) -> str:
+    if not task_id:
+        return ""
+    try:
+        mode = fetch_cbj_mode_from_task_logs(str(task_id)) or ""
+    except Exception as exc:
+        LOGGER.info("Could not resolve CBJ mode from task logs for taskId=%s: %s", task_id, exc)
+        return ""
+    if mode:
+        LOGGER.info("Resolved CBJ mode from task logs for taskId=%s: %s", task_id, mode)
+    return mode
+
+
+def item_cbj_task_id(item: dict[str, Any]) -> str:
+    collect = item.get("collect") or {}
+    for key in ("verifyTaskId", "taskId"):
+        value = collect.get(key)
+        if value:
+            return str(value)
+    resolved = collect.get("resolvedTask") or {}
+    for key in ("taskId", "id"):
+        value = resolved.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
 def item_requests_cbj_verification(item: dict[str, Any]) -> bool:
     for target in item.get("coverageSupplementTargets") or []:
         if str(target).startswith("CBJ_") or str(target).startswith("CBJ:"):
             return True
     collect = item.get("collect") or {}
     resolved = collect.get("resolvedTask") or {}
-    if str(resolved.get("backendTaxTypeId") or "") in {"26", "31"}:
+    if str(resolved.get("backendTaxTypeId") or "") in {"26", "31"} or str(resolved.get("backendTaxId") or "") == "39":
         return True
     for tax_item in collect.get("taxItems") or []:
         if str(tax_item.get("taxTypeId") or "") in {"26", "31"} and is_active_cbj_tax_item(tax_item):
@@ -1511,10 +4926,15 @@ def latest_cbj_summary_path(report_dir: Path) -> Path | None:
     return summaries[0] if summaries else None
 
 
-def latest_summary_path(report_dir: Path) -> Path | None:
+def latest_summary_path(report_dir: Path, since_ts: float | None = None) -> Path | None:
     if not report_dir.exists():
         return None
-    summaries = sorted(report_dir.glob("compare_summary_*.html"), key=lambda path: path.stat().st_mtime, reverse=True)
+    summaries = [
+        path
+        for path in report_dir.glob("compare_summary_*.html")
+        if since_ts is None or path.stat().st_mtime >= since_ts
+    ]
+    summaries = sorted(summaries, key=lambda path: path.stat().st_mtime, reverse=True)
     return summaries[0] if summaries else None
 
 
@@ -1557,10 +4977,38 @@ def any_report_has_errors(reports: list[dict[str, Any]]) -> bool:
                     return True
             except (TypeError, ValueError):
                 continue
+        if report.get("quality_issues"):
+            return True
     return False
 
 
-def compare_report_reason(task_id: str, max_forms: int = 4) -> str:
+def quality_issue_label(issue: Any) -> str:
+    text = str(issue or "").strip()
+    labels = {
+        "declaration_status_unknown": "申报状态未知",
+        "low_web_extraction_coverage": "网页解析覆盖率低",
+    }
+    if text.startswith("both_missing_ratio="):
+        return "接口和网页同时为空比例过高"
+    if text.startswith("mismatch="):
+        return f"不一致{text.split('=', 1)[1]}"
+    if text.startswith("api_missing="):
+        return f"接口缺失{text.split('=', 1)[1]}"
+    if text.startswith("web_missing="):
+        return f"网页缺失{text.split('=', 1)[1]}"
+    if text.startswith("parse_error="):
+        return f"解析失败{text.split('=', 1)[1]}"
+    if text.startswith("mapping_error="):
+        return f"映射异常{text.split('=', 1)[1]}"
+    return labels.get(text, text)
+
+
+def compare_report_reason(
+    task_id: str,
+    max_forms: int = 4,
+    reports: list[dict[str, Any]] | None = None,
+    since_ts: float | None = None,
+) -> str:
     issue_labels = [
         ("mismatch_count", "\u4e0d\u4e00\u81f4"),
         ("api_missing_count", "\u63a5\u53e3\u7f3a\u5931"),
@@ -1569,7 +5017,7 @@ def compare_report_reason(task_id: str, max_forms: int = 4) -> str:
         ("mapping_error_count", "\u6620\u5c04\u5f02\u5e38"),
     ]
     parts: list[str] = []
-    for report in load_compare_reports(task_id):
+    for report in reports if reports is not None else load_compare_reports(task_id, since_ts=since_ts):
         summary = report.get("summary") or {}
         issues = []
         for key, label in issue_labels:
@@ -1579,6 +5027,10 @@ def compare_report_reason(task_id: str, max_forms: int = 4) -> str:
                 count = 0
             if count > 0:
                 issues.append(f"{label}{count}")
+        for issue in report.get("quality_issues") or []:
+            label = quality_issue_label(issue)
+            if label and label not in issues:
+                issues.append(label)
         if not issues:
             continue
         form_name = (
@@ -1608,7 +5060,20 @@ def tail_error_reason(log_path: Path, max_lines: int = 80) -> str:
             continue
         if is_benign_verify_log_line(text):
             continue
-        if text.startswith(("RuntimeError:", "TimeoutError:", "ValueError:", "KeyError:", "FileNotFoundError:")):
+        if text.startswith(
+            (
+                "RuntimeError:",
+                "TimeoutError:",
+                "ValueError:",
+                "KeyError:",
+                "FileNotFoundError:",
+                "DeclarationQueryAuthError:",
+                "scripts.compare_tax_forms.DeclarationQueryAuthError:",
+                "scripts.compare_tax_forms.UndeclaredTaxTargetUnavailableError:",
+                "scripts.compare_tax_forms.UndeclaredTaxAlreadyDeclaredError:",
+                "playwright._impl._errors.Error:",
+            )
+        ):
             return text
     for line in reversed(lines[-max_lines:]):
         text = line.strip()
@@ -1659,7 +5124,7 @@ def derive_handling_info(
         category = "需人工介入"
         reason = collect_failure_reason(collect) or "取数流程未自动完成。"
         action = suggested_manual_action(reason, collect_status)
-    elif not collect.get("verifyTaskId") and verify_status == "skipped":
+    elif not collect_task_ids(collect) and verify_status == "skipped":
         category = "未获取taskId"
         reason = collect_failure_reason(collect) or str(verify.get("reason") or "") or "后台未解析到取数任务。"
         action = "在任务列表按税号、期间、任务类型“取数”确认是否生成成功任务。"
@@ -1870,6 +5335,7 @@ def suggested_manual_action(reason: str, collect_status: str) -> str:
 
 def verification_risks(verify: dict[str, Any]) -> list[str]:
     risks: list[str] = []
+    actionable_low_coverage_forms = actionable_low_web_coverage_forms(verify)
     stderr_log = verify.get("stderrLog")
     if stderr_log:
         for line in read_log_lines(Path(str(stderr_log)), max_lines=300):
@@ -1877,6 +5343,8 @@ def verification_risks(verify: dict[str, Any]) -> list[str]:
                 match = re.search(r"([A-Za-z0-9_]+) low web extraction coverage: ([^\r\n]+)", line)
                 if match:
                     form_id = match.group(1)
+                    if form_id not in actionable_low_coverage_forms:
+                        continue
                     coverage = match.group(2).strip()
                     risks.append(f"{form_id_display_name(form_id)}网页解析覆盖率低：{coverage}")
                 else:
@@ -1887,7 +5355,35 @@ def verification_risks(verify: dict[str, Any]) -> list[str]:
                 risks.append("税局登录超时")
             elif "登录失效" in line or "数字账户" in line:
                 risks.append(compact_message(line))
+            elif "declaration_status_unknown" in line:
+                continue
     return unique_texts([risk for risk in risks if risk])
+
+
+def actionable_low_web_coverage_forms(verify: dict[str, Any]) -> set[str]:
+    forms: set[str] = set()
+    for report in load_reports_from_verify(verify):
+        form_id = str(report.get("batch_id") or report.get("target_id") or report.get("form_id") or "")
+        summary = report.get("summary") or {}
+        try:
+            web_missing_count = int(summary.get("web_missing_count", 0) or 0)
+        except (TypeError, ValueError):
+            web_missing_count = 0
+        quality_issues = {str(issue) for issue in report.get("quality_issues") or []}
+        if web_missing_count > 0 or "low_web_extraction_coverage" in quality_issues:
+            forms.add(form_id)
+    return forms
+
+
+def load_reports_from_verify(verify: dict[str, Any]) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    for report_path in verify.get("reportPaths") or []:
+        path = Path(str(report_path))
+        try:
+            reports.append(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return reports
 
 
 def read_log_lines(path: Path, max_lines: int = 300) -> list[str]:
@@ -1939,6 +5435,155 @@ def compact_message(value: Any, limit: int = 180) -> str:
     return text
 
 
+def normalize_supplement_failure_reason(value: Any, limit: int = 260) -> str:
+    text = compact_message(repair_mojibake_text(value), limit=900)
+    if not text:
+        return "验证后没有命中目标税种/申报状态。"
+    lower = text.lower()
+    if "pendingtaxloginjoberror" in lower or "已有进税局任务未完成" in text or "之前执行过 进税局" in text:
+        task_id = extract_pending_tax_login_task_id(text)
+        suffix = f"占用任务：{task_id}。" if task_id else ""
+        return compact_message(
+            f"已有进税局任务未完成，新的税局登录被后台拒绝。{suffix}请等待占用任务结束，或在后台处理后重试。",
+            limit,
+        )
+    if (
+        "getclientjob returned incomplete tax-login metadata" in lower
+        or "getclientjob returned a non-object response" in lower
+        or "getclientjob failed" in lower
+        or "getclientjob failed after retries" in lower
+        or "cannot resolve inner taskid from getclientjob response" in lower
+        or "cannot resolve province from getclientjob response" in lower
+        or "cannot resolve province from task cookie/client job data" in lower
+    ):
+        return compact_message(
+            "Tax bureau login failed: getClientJob did not return complete tax-login metadata. "
+            "The backend candidate's enter-tax-bureau login state is not ready; try the next candidate or recreate the collection task.",
+            limit,
+        )
+    if "gettaskcookie failed" in lower:
+        detail = clean_failure_detail(text.split(":", 1)[1] if ":" in text else "")
+        if is_tax_login_switch_limit_reason(detail):
+            return "税局登录被后台限制：同省税局切换过于频繁或仍有登录任务占用，请等待限制解除后重试。"
+        if "登录连接状态已失效" in detail or "重新发起任务" in detail:
+            return "税局登录失败：登录连接状态已失效，请重新发起取数任务后再验证。"
+        if is_unreadable_failure_detail(detail):
+            return "税局登录失败：获取进税局 cookie 失败，原始返回内容不可读。通常是登录连接状态失效、进税局任务过期或需要重新发起任务。"
+        suffix = f" 原始提示：{detail}" if detail else ""
+        return compact_message(f"税局登录失败：获取进税局 cookie 失败。通常是登录连接状态失效、进税局任务过期或需要重新发起任务。{suffix}", limit)
+    if (
+        "declarationqueryautherror" in lower
+        or "taxloginnotreadyerror" in lower
+        or "tax bureau login state or digital account authentication is not ready" in lower
+        or ("tpass." in lower and "#/login" in lower)
+        or "declaration query did not become usable" in lower
+        or "stayed on loading page" in lower
+        or "\u7a0e\u5c40\u767b\u5f55\u6001" in text
+        or "\u6570\u5b57\u8d26\u6237\u8ba4\u8bc1" in text
+        or "统一登录页" in text
+        or "数字账户认证" in text
+    ):
+        return "税局登录态或数字账户认证已失效，请人工重新进入对应税局/数字账户后重试。"
+    if "needforcetax" in lower or "force-enter confirmation" in lower:
+        return "税局已有进行中的任务，需要人工确认是否强制进入税局后再验证。"
+    if "tax bureau login timeout" in lower or "login timeout" in lower:
+        return "税局登录超时：未在限定时间内进入已登录税局页面，请重新进入税局后重试。"
+    if "could not navigate to declaration query page" in lower:
+        target = extract_failure_target(text)
+        url = extract_failure_url(text)
+        target_text = form_id_display_name(target) if target else "目标申报表"
+        url_text = f"当前URL：{shorten_url(url)}" if url else ""
+        return compact_message(
+            f"未能进入申报信息查询页：打开{target_text}前，税局页面停留在非申报查询页。请重新进入对应税局/数字账户后重试。{url_text}",
+            limit,
+        )
+    if "/loading" in lower and ("declaration query" in lower or "申报" in text):
+        return "未能进入申报信息查询页：税局页面停留在 loading 状态，请重新进入对应税局/数字账户后重试。"
+    if "declaration row was not found" in lower or "query returned no row" in lower:
+        return "未查询到目标申报记录：请核对申报表种类、所属期、申报日期条件，或确认该税种本期是否已申报。"
+    if "undeclaredtaxtargetunavailableerror" in lower or "undeclared tax target is unavailable" in lower:
+        target = extract_failure_target(text)
+        target_text = form_id_display_name(target) if target else "目标税种"
+        return compact_message(
+            f"税局当前未找到{target_text}的未申报入口；如果页面只显示 B 类、核定征收或热门服务入口，应按源任务状态不匹配处理，不进入字段比对。",
+            limit,
+        )
+    if "no_resultjson" in lower or "no resultjson" in lower:
+        return "后台任务没有生成可验证结果 JSON：任务可能尚未成功完成或结果未保存，不能进入字段验证。"
+    if is_no_targets_verify_reason(text):
+        return "该 taskId 没有自动匹配到项目当前支持的税种/表单，未进入字段验证。"
+    if "target form" in lower and ("not found" in lower or "confirm" in lower):
+        return "未能切换或确认目标申报表：税局页面可能停留在其它表单或菜单结构已变化。"
+    text = re.sub(r"^(RuntimeError|TimeoutError|ValueError|Exception):\s*", "", text, flags=re.IGNORECASE)
+    text = clean_failure_detail(text)
+    return compact_message(text or "验证任务失败，未解析到更明确原因。", limit)
+
+
+def extract_pending_tax_login_task_id(text: str) -> str:
+    match = re.search(r"进税局\((\d{12,})\)", str(text or ""))
+    if match:
+        return match.group(1)
+    match = re.search(r"占用任务[:：]\s*(\d{12,})", str(text or ""))
+    if match:
+        return match.group(1)
+    return ""
+
+
+def repair_mojibake_text(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    candidates = [text]
+    for encoding in ("gbk", "cp936", "latin1", "cp1252"):
+        try:
+            candidates.append(text.encode(encoding).decode("utf-8"))
+        except Exception:
+            pass
+    return min(candidates, key=lambda item: (mojibake_score(item), -cjk_count(item), len(item)))
+
+
+def mojibake_score(text: str) -> int:
+    score = text.count("\ufffd") * 6 + text.count("□") * 4
+    for token in ("锛", "銆", "鍚", "鐧", "绋", "鏁", "浠", "璐", "浜", "涓", "鈥", "€", "鑱", "楠"):
+        score += text.count(token) * 2
+    return score
+
+
+def cjk_count(text: str) -> int:
+    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+
+
+def clean_failure_detail(value: Any) -> str:
+    text = compact_message(repair_mojibake_text(value), limit=360)
+    text = re.sub(r"^(RuntimeError|TimeoutError|ValueError|Exception):\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^getTaskCookie failed[:：]?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[（(]?\s*响应id[:：][^）)\s]+[）)]?", "", text, flags=re.IGNORECASE)
+    return text.strip("；;，,。 ")
+
+
+def is_unreadable_failure_detail(text: str) -> bool:
+    if not text:
+        return False
+    if "\ufffd" in text or "□" in text:
+        return True
+    return mojibake_score(text) >= 6 and cjk_count(text) < 6
+
+
+def extract_failure_target(text: str) -> str:
+    match = re.search(r"target=([A-Za-z0-9_]+)", text)
+    return match.group(1) if match else ""
+
+
+def extract_failure_url(text: str) -> str:
+    match = re.search(r"url=([^;\s]+)", text)
+    return match.group(1) if match else ""
+
+
+def shorten_url(url: str, limit: int = 110) -> str:
+    text = str(url or "")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def unique_texts(values: list[str]) -> list[str]:
     result = []
     seen = set()
@@ -1961,12 +5606,13 @@ def render_summary(state: dict[str, Any], run_dir: Path) -> Path:
     dashboard = build_dashboard(state, run_dir)
     write_dashboard_csvs(dashboard, run_dir)
     try:
-        write_coverage_status(run_dir)
+        write_coverage_status(run_dir, targets=coverage_targets_for_state(state))
     except Exception as exc:
         LOGGER.warning("Could not write coverage status for %s: %s", run_dir, exc)
 
     form_columns = dashboard["form_columns"]
-    tax_rows = render_tax_matrix_rows(dashboard["items"], form_columns, run_dir)
+    verified_matrix_items = [item for item in dashboard["items"] if item.get("formResults")]
+    tax_rows = render_tax_matrix_rows(verified_matrix_items, form_columns, run_dir)
     problem_detail_sections = render_problem_detail_sections(dashboard["problem_details"], run_dir)
     problem_form_nav = render_problem_form_nav(dashboard["problem_details"])
     kpis = dashboard["kpis"]
@@ -2045,7 +5691,19 @@ def render_summary(state: dict[str, Any], run_dir: Path) -> Path:
     .coverage-panel .coverage-summary {{ margin-bottom: 8px; color: #52606d; }}
     .coverage-table th:nth-child(1) {{ width: 180px; }}
     .coverage-table th:nth-child(2) {{ width: 90px; }}
-    .coverage-table th:nth-child(3) {{ width: 110px; }}
+    .coverage-table th:nth-child(3) {{ width: 90px; }}
+    .coverage-table th:nth-child(4) {{ width: 150px; }}
+    .coverage-table th:nth-child(5) {{ width: 150px; }}
+    .coverage-table th:nth-child(6) {{ width: 220px; }}
+    .attempt-table th:nth-child(1) {{ width: 170px; }}
+    .attempt-table th:nth-child(2) {{ width: 80px; }}
+    .attempt-table th:nth-child(3) {{ width: 150px; }}
+    .attempt-table th:nth-child(4) {{ width: 150px; }}
+    .attempt-table th:nth-child(5) {{ width: 70px; }}
+    .attempt-table th:nth-child(6) {{ width: 80px; }}
+    .attempt-table th:nth-child(7) {{ width: 120px; }}
+    .attempt-table {{ table-layout: fixed; min-width: 1100px; }}
+    .attempt-table td.reason-cell {{ white-space: normal; min-width: 320px; max-width: 620px; word-break: break-word; overflow-wrap: anywhere; }}
   </style>
 </head>
 <body>
@@ -2084,7 +5742,6 @@ def build_dashboard(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     forms: dict[str, dict[str, Any]] = {}
     problems: dict[tuple[str, str], dict[str, Any]] = {}
     problem_details: list[dict[str, Any]] = []
-
     for tax_no, item in state.get("items", {}).items():
         collect = item.get("collect") or {}
         verify = item.get("verify") or {}
@@ -2092,20 +5749,30 @@ def build_dashboard(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
         display_tax_no = str(item.get("taxNo") or tax_no)
         area_code = str(account.get("areaCode") or "")[:2]
         region = region_name(area_code)
-        task_id = collect.get("verifyTaskId") or ""
-        reports = load_compare_reports(task_id)
+        item_task_ids = item_verification_task_ids(item)
+        task_id = format_task_ids(item_task_ids)
+        report_entries: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+        for current_task_id in item_task_ids:
+            task_verify = task_verify_entry(item, current_task_id)
+            if not task_verify and len(item_task_ids) == 1:
+                task_verify = verify
+            if not verify_record_should_load_reports(task_verify):
+                continue
+            paths = task_verify.get("reportPaths") if task_verify else None
+            for report in load_compare_reports(current_task_id, paths=paths or None):
+                report_entries.append((current_task_id, task_verify, report))
         form_results = {}
         total_passed = 0
         total_denominator = 0
         raw_rates = []
         problem_count = 0
 
-        for report in reports:
+        for report_task_id, report_verify, report in report_entries:
             form_id = str(report.get("batch_id") or "")
             form_name = str(report.get("form_name") or form_id)
             tax_type = normalize_coverage_tax_type(report.get("tax_type"), form_id=form_id)
             tax_type_name = tax_type_display_name(tax_type)
-            declaration_status = declaration_status_for_report(report)
+            declaration_status = declaration_status_for_report(report, tax_type=tax_type)
             summary = report.get("summary") or {}
             fields = report.get("field_results") or []
             form_problems = problem_fields(fields)
@@ -2156,10 +5823,10 @@ def build_dashboard(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
                     build_problem_detail(
                         tax_no=display_tax_no,
                         cust_name=account.get("custName") or "",
-                        task_id=task_id,
+                        task_id=report_task_id,
                         area_code=area_code,
                         region=region,
-                        summary_path=verify.get("summaryPath") or "",
+                        summary_path=report_verify.get("summaryPath") or verify.get("summaryPath") or "",
                         form_id=form_id,
                         form_name=form_name,
                         tax_type=tax_type,
@@ -2243,16 +5910,50 @@ def build_dashboard(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     }
 
 
-def load_compare_reports(task_id: str) -> list[dict[str, Any]]:
+def verify_record_should_load_reports(verify: dict[str, Any]) -> bool:
+    if not isinstance(verify, dict):
+        return False
+    return str(verify.get("status") or "") in {"success", "completed_with_differences"}
+
+
+def supplement_target_keys_for_item(item: dict[str, Any]) -> set[str]:
+    keys: set[str] = {
+        str(value or "")
+        for value in (item.get("coverageSupplementTargets") or [])
+        if str(value or "")
+    }
+    resolved = (item.get("collect") or {}).get("resolvedTask") or {}
+    resolved_target = str(resolved.get("coverageTarget") or "")
+    if resolved_target:
+        keys.add(resolved_target)
+    return keys
+
+
+def load_compare_reports(
+    task_id: str,
+    since_ts: float | None = None,
+    paths: list[str] | None = None,
+) -> list[dict[str, Any]]:
     if not task_id:
         return []
-    report_dir = Path("output") / "reports" / task_id
-    if not report_dir.exists():
-        return []
+    if paths:
+        report_paths = [Path(path) for path in paths if str(path or "").strip()]
+    else:
+        report_dir = Path("output") / "reports" / task_id
+        if not report_dir.exists():
+            return []
+        report_paths = sorted(report_dir.glob("*_compare_*.json"))
     reports = []
-    for path in sorted(report_dir.glob("*_compare_*.json")):
+    for path in report_paths:
+        if not path.exists():
+            continue
+        if since_ts is not None and path.stat().st_mtime < since_ts:
+            continue
         try:
-            reports.append(json.loads(path.read_text(encoding="utf-8")))
+            report = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(report, dict):
+                report["_sourcePath"] = str(path)
+            reports.append(report)
         except Exception as exc:
             LOGGER.warning("Could not load compare report %s: %s", path, exc)
     return reports
@@ -2326,18 +6027,101 @@ def tax_type_display_name(tax_type: Any) -> str:
     return TAX_TYPE_LABELS.get(text, text)
 
 
-def declaration_status_for_report(report: dict[str, Any]) -> str:
+def declaration_status_display_name(status: Any) -> str:
+    text = str(status or "").strip()
+    return DECLARATION_STATUS_LABELS.get(text, text or "未知")
+
+
+def coverage_supplement_status_display_name(status: Any) -> str:
+    text = str(status or "").strip()
+    return COVERAGE_SUPPLEMENT_STATUS_LABELS.get(text, text or "未执行")
+
+
+def format_declaration_status_counts(status_counts: dict[str, Any]) -> str:
+    if not status_counts:
+        return "无"
+    order = {"unknown": 0, "unfiled": 1, "filed": 2}
+    def count_value(key: str) -> int:
+        try:
+            return int(status_counts.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+    keys = sorted(
+        status_counts,
+        key=lambda key: (-count_value(key), order.get(str(key), 99), str(key)),
+    )
+    parts = []
+    for key in keys:
+        label = declaration_status_display_name(key)
+        parts.append(f"{label}：{status_counts.get(key)} 个")
+    return "；".join(parts)
+
+
+def format_task_tax_type_counts(counts: dict[str, Any]) -> str:
+    if not counts:
+        return "无"
+
+    def count_value(key: str) -> int:
+        try:
+            return int(counts.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    keys = sorted(counts, key=lambda key: (-count_value(key), str(key)))
+    parts = []
+    for key in keys:
+        if str(key) == "CBJ_UNKNOWN":
+            parts.append(f"残保金类型未知：{counts.get(key)} 个")
+            continue
+        label = "未知" if str(key) == "unknown" else tax_type_display_name(key)
+        parts.append(f"{label}：{counts.get(key)} 个")
+    return "；".join(parts)
+
+
+def format_cbj_mode_source_counts(counts: dict[str, Any]) -> str:
+    if not counts:
+        return ""
+
+    labels = {
+        "execution_log_annual": "执行日志识别为汇算清缴",
+        "execution_log_personal": "执行日志识别为个税",
+        "task_list_fields": "任务列表字段识别为个税",
+        "api_result_fields": "接口字段识别为个税",
+        "api_result_missing": "接口字段缺失",
+        "api_error": "接口读取失败",
+        "backend_tax_type_31": "后台税种ID识别为汇算清缴",
+        "backend_tax_id_unknown": "残保金类型未知",
+        "unknown": "未知",
+    }
+
+    def count_value(key: str) -> int:
+        try:
+            return int(counts.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    parts = []
+    for key in sorted(counts, key=lambda value: (-count_value(value), str(value))):
+        parts.append(f"{labels.get(str(key), str(key))}：{counts.get(key)} 个")
+    return "；".join(parts)
+
+
+def declaration_status_for_report(report: dict[str, Any], tax_type: Any = "") -> str:
+    tax_type_text = str(tax_type or "")
+    if tax_type_text == "CBJ_PERSONAL":
+        return "已取数"
+    if tax_type_text == "CBJ_ANNUAL":
+        return "已验证"
     status = report.get("declaration_status") or report.get("declarationStatus")
     if status:
-        return str(status)
+        normalized = declaration_status_display_name(status)
+        return "未申报" if normalized == "未知" else normalized
     current_period_flag = report.get("current_period_flag")
     if current_period_flag is False:
         return "未申报"
     if current_period_flag is True:
         return "已申报"
-    if report.get("field_results"):
-        return "已申报"
-    return "未知"
+    return "未申报"
 
 
 def summarize_verified_tax_statuses(form_results: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
@@ -2347,29 +6131,60 @@ def summarize_verified_tax_statuses(form_results: dict[str, dict[str, Any]]) -> 
         if not tax_type:
             continue
         raw_status = str(form.get("declarationStatus") or "")
+        if tax_type in {"CBJ_PERSONAL", "CBJ_ANNUAL"}:
+            display_status = "已取数" if tax_type == "CBJ_PERSONAL" else "已验证"
+            statuses[tax_type] = {
+                "taxType": tax_type,
+                "taxTypeName": short_tax_type_name(form.get("taxTypeName") or tax_type_display_name(tax_type)),
+                "declarationStatus": display_status,
+                "rawStatuses": raw_status,
+            }
+            continue
         status = normalize_declaration_status(raw_status)
         item = statuses.setdefault(
             tax_type,
             {
                 "taxType": tax_type,
                 "taxTypeName": short_tax_type_name(form.get("taxTypeName") or tax_type_display_name(tax_type)),
-                "declarationStatus": "已申报",
+                "declarationStatus": "",
                 "rawStatuses": "",
+                "_statusValues": [],
             },
         )
-        if status == "未申报":
-            item["declarationStatus"] = "未申报"
+        item.setdefault("_statusValues", []).append(status)
         raw_statuses = [part for part in item.get("rawStatuses", "").split(" / ") if part]
         if raw_status and raw_status not in raw_statuses:
             raw_statuses.append(raw_status)
         item["rawStatuses"] = " / ".join(raw_statuses)
-    return list(statuses.values())
+
+    rows = []
+    for item in statuses.values():
+        values = [str(value or "") for value in item.pop("_statusValues", [])]
+        unique_values = set(values)
+        if "未知" in unique_values or not unique_values:
+            item["declarationStatus"] = "未知"
+        elif "未申报" in unique_values and "已申报" in unique_values:
+            item["declarationStatus"] = "未知"
+        elif "未申报" in unique_values:
+            item["declarationStatus"] = "未申报"
+        elif "已申报" in unique_values:
+            item["declarationStatus"] = "已申报"
+        else:
+            item["declarationStatus"] = values[-1] if values else "未知"
+        rows.append(item)
+    return rows
 
 
 def normalize_declaration_status(status: Any) -> str:
     text = str(status or "").strip()
-    if text in {"未申报", "未申报/未取数", "未知", ""}:
+    if "不区分" in text:
+        return "不区分申报状态"
+    if text in {"未知", ""}:
         return "未申报"
+    if text in {"未申报", "未申报/未取数"}:
+        return "未申报"
+    if text in {"已申报", "申报成功"}:
+        return "已申报"
     return "已申报"
 
 
@@ -2685,55 +6500,183 @@ def render_coverage_section(run_dir: Path) -> str:
     except Exception:
         return ""
     summary = payload.get("summary") or {}
+    targets = payload.get("targets") or []
     missing = payload.get("missingTargets") or []
     supplement = payload.get("supplement") or {}
     diagnostics = {str(item.get("targetKey") or ""): item for item in supplement.get("diagnostics") or []}
-    if not missing:
-        text = (
-            f"已覆盖 {summary.get('coveredTargets', 0)}/{summary.get('totalTargets', 0)} 个目标，"
-            "当前没有未覆盖税种/申报状态。"
-        )
-        return f'<div class="coverage-panel"><h2>覆盖缺口说明</h2><div class="coverage-summary">{escape_html(text)}</div></div>'
+    if not targets and missing:
+        missing_keys = {str(target.get("key") or "") for target in missing}
+        targets = [{**target, "covered": str(target.get("key") or "") not in missing_keys, "examples": []} for target in missing]
 
     rows = []
-    for target in missing:
+    for target in targets:
         key = str(target.get("key") or "")
         diag = diagnostics.get(key) or {}
-        reason = coverage_gap_reason(target, supplement, diag)
+        covered = bool(target.get("covered"))
+        examples = target.get("examples") or []
+        example = examples[0] if examples else {}
+        reason = "" if covered else coverage_gap_reason(target, supplement, diag)
+        tax_type_name = target.get("taxTypeName") or tax_type_display_name(target.get("taxType"))
+        declaration_status_name = (
+            target.get("declarationStatusName")
+            or declaration_status_display_name(target.get("declarationStatus"))
+        )
+        task_id = str(example.get("taskId") or "")
+        report_path = str(example.get("sourcePath") or "")
+        task_html = (
+            f'<a href="{escape_html(relative_to(run_dir, Path(report_path)))}"><code>{escape_html(task_id)}</code></a>'
+            if task_id and report_path
+            else (f"<code>{escape_html(task_id)}</code>" if task_id else "")
+        )
         rows.append(
             "<tr>"
-            f"<td>{escape_html(target.get('taxTypeName') or target.get('taxType'))}<br><code>{escape_html(key)}</code></td>"
-            f"<td>{escape_html(target.get('declarationStatusName') or target.get('declarationStatus'))}</td>"
-            f"<td>{escape_html(','.join(str(item) for item in target.get('backendTaxTypeIds') or []))}</td>"
+            f"<td>{escape_html(tax_type_name)}</td>"
+            f"<td>{escape_html(declaration_status_name)}</td>"
+            f"<td>{coverage_status_badge(covered)}</td>"
+            f"<td>{escape_html(example.get('taxNo') or '')}</td>"
+            f"<td>{task_html}</td>"
             f"<td>{escape_html(reason)}</td>"
             "</tr>"
         )
+    supplement_status = coverage_supplement_status_display_name(supplement.get("status"))
+    attempts_html = render_supplement_attempts_table(run_dir, supplement.get("attempts") or [])
+    covered_targets = summary.get("coveredTargets", 0)
+    total_targets = summary.get("totalTargets", len(targets))
+    missing_count = summary.get("missingTargets", len(missing))
     summary_text = (
-        f"已覆盖 {summary.get('coveredTargets', 0)}/{summary.get('totalTargets', 0)} 个目标，"
-        f"仍有 {len(missing)} 个税种/申报状态未覆盖。后台补齐状态：{supplement.get('status') or 'not_run'}。"
+        f"已覆盖 {covered_targets}/{total_targets} 个税种/申报状态，"
+        f"未覆盖 {missing_count} 个。后台补齐状态：{supplement_status}。"
     )
     return (
         '<div class="coverage-panel">'
-        "<h2>覆盖缺口说明</h2>"
+        "<h2>税种覆盖说明</h2>"
         f'<div class="coverage-summary">{escape_html(summary_text)}</div>'
         '<div class="scroll"><table class="coverage-table">'
-        "<thead><tr><th>税种</th><th>状态</th><th>后台税种ID</th><th>直接原因</th></tr></thead>"
+        "<thead><tr><th>税种</th><th>申报状态</th><th>覆盖情况</th><th>代表税号</th><th>taskId</th><th>未覆盖原因</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody>"
         "</table></div>"
+        f"{attempts_html}"
         "</div>"
     )
 
 
+def coverage_status_badge(covered: bool) -> str:
+    if covered:
+        return '<span class="status ok">已覆盖</span>'
+    return '<span class="status fail">未覆盖</span>'
+
+
+def render_supplement_attempts_table(run_dir: Path, attempts: list[dict[str, Any]]) -> str:
+    if not attempts:
+        return ""
+    rows = []
+    for attempt in attempts:
+        summary_path = str(attempt.get("summaryPath") or "")
+        task_id = str(attempt.get("taskId") or "")
+        task_html = (
+            f'<a href="{escape_html(relative_to(run_dir, Path(summary_path)))}"><code>{escape_html(task_id)}</code></a>'
+            if task_id and summary_path
+            else (f"<code>{escape_html(task_id)}</code>" if task_id else "")
+        )
+        status = str(attempt.get("status") or "")
+        css = "ok" if status == "covered" else ("warn" if status == "verifying" else "fail")
+        status_label = {
+            "covered": "已覆盖",
+            "verifying": "验证中",
+            "failed": "失败",
+        }.get(status, status or "未知")
+        rows.append(
+            "<tr>"
+            f"<td>{escape_html(attempt.get('taxTypeName') or tax_type_display_name(attempt.get('taxType')))}</td>"
+            f"<td>{escape_html(attempt.get('declarationStatusName') or declaration_status_display_name(attempt.get('declarationStatus')))}</td>"
+            f"<td>{escape_html(attempt.get('taxNo') or '')}</td>"
+            f"<td>{task_html}</td>"
+            f"<td>{escape_html(attempt.get('attemptNo') or '')}/{escape_html(attempt.get('totalCandidates') or '')}</td>"
+            f'<td><span class="status {css}">{escape_html(status_label)}</span></td>'
+            f"<td>{escape_html(attempt.get('step') or '')}</td>"
+            f"<td class=\"reason-cell\">{escape_html(normalize_supplement_failure_reason(attempt.get('reason') or ''))}</td>"
+            "</tr>"
+        )
+    return (
+        "<h2>后台补齐尝试记录</h2>"
+        '<div class="scroll"><table class="attempt-table">'
+        "<thead><tr><th>税种</th><th>申报状态</th><th>候选税号</th><th>taskId</th><th>序号</th><th>结果</th><th>失败/完成步骤</th><th>直接原因</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table></div>"
+    )
+
+
+def supplement_source_readiness_for_target(supplement: dict[str, Any], target_key: str) -> dict[str, Any]:
+    for item in supplement.get("sourceReadiness") or []:
+        if isinstance(item, dict) and str(item.get("targetKey") or "") == str(target_key or ""):
+            return item
+    return {}
+
+
+def format_source_readiness_gap_text(readiness: dict[str, Any]) -> str:
+    if not readiness:
+        return ""
+    message = str(readiness.get("message") or "").strip()
+    next_action = str(readiness.get("nextAction") or "").strip()
+    if message and next_action:
+        return f"{message}\u4e0b\u4e00\u6b65\uff1a{next_action}"
+    return message or next_action
+
+
 def coverage_gap_reason(target: dict[str, Any], supplement: dict[str, Any], diagnostic: dict[str, Any]) -> str:
+    target_key = str(target.get("key") or diagnostic.get("targetKey") or "")
+    readiness = supplement_source_readiness_for_target(supplement, target_key)
+    readiness_text = format_source_readiness_gap_text(readiness)
+    attempts = [
+        item
+        for item in supplement.get("attempts") or []
+        if str(item.get("targetKey") or "") == target_key
+    ]
+    if attempts and not any(str(item.get("status") or "") == "covered" for item in attempts):
+        last_attempt = attempts[-1]
+        attempt_reason = normalize_supplement_failure_reason(last_attempt.get("reason") or "未命中目标覆盖状态")
+        punctuation = "" if attempt_reason.endswith(("。", "！", "？", ".", "!", "?")) else "。"
+        text = (
+            f"后台已找到并尝试 {len(attempts)} 个候选任务，"
+            f"最后失败步骤：{last_attempt.get('step') or '验证任务'}；"
+            f"原因：{attempt_reason}{punctuation}"
+        )
+        if readiness_text:
+            text += f"来源预检：{readiness_text}"
+        return text
+    if readiness_text and str(readiness.get("status") or "") not in {"fresh_task_ready"}:
+        return readiness_text
     reason = str(diagnostic.get("reason") or "")
     queried = diagnostic.get("queriedCount")
     status_counts = diagnostic.get("statusCounts") or {}
+    task_type_counts = diagnostic.get("taskTaxTypeCounts") or {}
     if reason == "no_success_collect_tasks":
         return f"后台当月没有查到该税种的成功取数任务（查询数量 {queried or 0}）。"
     if reason == "declaration_status_not_matched":
-        return f"后台有成功任务，但申报状态不符合目标；解析分布：{status_counts}。"
+        return f"后台有成功任务，但申报状态不符合目标；解析分布：{format_declaration_status_counts(status_counts)}。"
     if reason == "declaration_status_unknown":
         return f"后台有成功任务，但未能从任务结果或执行日志解析申报状态（查询数量 {queried or 0}）。"
+    if reason == "required_backend_fields_missing":
+        fields = diagnostic.get("requiredFields") or []
+        field_text = "、".join(str(field) for field in fields if field) or "目标税种必需字段"
+        missing_count = diagnostic.get("requiredFieldMissingCount") or 0
+        return (
+            f"后台有成功任务，但任务结果缺少{field_text}，"
+            f"不能作为该税种的补齐任务（不符合数量 {missing_count}）。"
+        )
+    if reason == "target_tax_type_not_matched":
+        cbj_source_counts = diagnostic.get("cbjModeSourceCounts") or {}
+        cbj_source_text = format_cbj_mode_source_counts(cbj_source_counts)
+        if cbj_source_text:
+            return (
+                "后台有成功任务，但任务实际类型不是目标税种/纳税人类型；"
+                f"任务类型分布：{format_task_tax_type_counts(task_type_counts)}；"
+                f"残保金识别来源分布：{cbj_source_text}。"
+            )
+        return (
+            "后台有成功任务，但任务实际类型不是目标税种/纳税人类型；"
+            f"任务类型分布：{format_task_tax_type_counts(task_type_counts)}。"
+        )
     if reason:
         return reason
     if supplement.get("status") in {"not_run", "failed", "no_candidates"}:
@@ -2779,6 +6722,8 @@ def render_tax_matrix_header(form_columns: list[tuple[str, str]]) -> str:
 def render_tax_matrix_rows(items: list[dict[str, Any]], form_columns: list[tuple[str, str]], run_dir: Path) -> str:
     rows = []
     for item in items:
+        if not item.get("formResults"):
+            continue
         form_cells = []
         for form_id, _ in form_columns:
             form = item["formResults"].get(form_id)
@@ -2804,6 +6749,9 @@ def render_tax_matrix_rows(items: list[dict[str, Any]], form_columns: list[tuple
             f"<td>{report_link}</td>"
             "</tr>"
         )
+    if not rows:
+        colspan = 10 + len(form_columns)
+        return f'<tr><td colspan="{colspan}" class="quiet">暂无完成完整验证流程的表单结果。</td></tr>'
     return "".join(rows)
 
 
@@ -2827,14 +6775,8 @@ def render_form_cell(form: dict[str, Any] | None) -> str:
     problem_count = int(form.get("problemCount") or 0)
     rate = form.get("effectiveRate")
     css = "ok" if problem_count == 0 else "warn"
-    declaration_status = form.get("declarationStatus") or ""
     label = "通过" if problem_count == 0 else f"{problem_count}项"
-    if declaration_status and declaration_status != "已申报" and problem_count == 0:
-        label = declaration_status
-        css = "warn"
     title = f"通过率：{format_rate(rate)}；问题数：{problem_count}"
-    if declaration_status:
-        title += f"；申报状态：{declaration_status}"
     return f'<td class="form-cell"><span class="cell {css}" title="{escape_html(title)}">{escape_html(label)}</span></td>'
 
 
@@ -3185,11 +7127,11 @@ def render_problem_status(detail: dict[str, Any]) -> str:
 
 
 def tax_item_status_css(status: str) -> str:
-    if status == "已申报":
+    if status in {"已申报", "未申报", "已取数", "已验证", "不区分申报状态"}:
         return "ok"
     if status == "取数失败":
         return "fail"
-    if status in {"取数中", "未申报", "未申报/未取数"}:
+    if status in {"取数中", "未申报/未取数", "未知"}:
         return "warn"
     return "idle"
 
@@ -3245,11 +7187,11 @@ def status_badge(value: Any, manual_required: bool = False) -> str:
         return '<span class="status fail">需人工</span>'
     if not text:
         return '<span class="status idle">未执行</span>'
-    if upper in {"SUCCESS", "COLLECTED", "COLLECTED_PART", "SUCCESSFUL", "DONE", "OK"} or text in {"success", "已申报"}:
+    if upper in {"SUCCESS", "COLLECTED", "COLLECTED_PART", "SUCCESSFUL", "DONE", "OK"} or text in {"success", "已申报", "未申报"}:
         css = "ok"
     elif upper in {"FAILURE", "COLLECTED_FAIL", "FAILED", "ERROR"} or text in {"failed", "取数失败"}:
         css = "fail"
-    elif "difference" in text or upper in {"DOING", "WAITING", "TODO", "COLLECTING"} or text in {"未申报", "取数中", "未申报/未取数"}:
+    elif "difference" in text or upper in {"DOING", "WAITING", "TODO", "COLLECTING"} or text in {"取数中", "未申报/未取数"}:
         css = "warn"
     else:
         css = "idle"

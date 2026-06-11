@@ -1,0 +1,4 @@
+interface:
+  display_name: "易代账创建账套"
+  short_description: "登录易代账并创建客户账套，保存税务登录信息。"
+  default_prompt: "使用 ydz-create-accountset 在易代账环境新建账套，税号为 <税号>。"

@@ -12,6 +12,7 @@ from src.config.province_config import (
     calc_etax_port, get_loginb_url, get_tpass_login_url,
     get_tpass_cookie_key, get_tax_domains, TPASS_COOKIE_KEY_MAP,
 )
+from src.login.log_sanitizer import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,15 @@ class LoginDetector:
     def is_logged_in(self, page: Page) -> bool:
         """Check if logged in. Returns True if on main page (not login page)."""
         url = page.url
+        lower_url = (url or "").lower()
+        if (
+            "/loading" in lower_url
+            or "/mhzx/api/mh/tpass/code" in lower_url
+            or "tpass." in lower_url
+            and "#/login" in lower_url
+        ):
+            logger.info(f"Not logged in: transient or login url={redact_sensitive_text(url)}")
+            return False
         on_main = False
         not_on_login = True
 
@@ -61,11 +71,31 @@ class LoginDetector:
                 "\u201c\u591a\u5408\u4e00\u201d\u767b\u5f55",
                 "\u6253\u5f00\u7535\u5b50\u7a0e\u52a1\u5c40APP\u626b\u4e00\u626b",
             )
+            session_expired_hints = (
+                "\u4f1a\u8bdd\u5931\u6548",
+                "\u767b\u5f55\u5df2\u5931\u6548",
+                "\u767b\u5f55\u8d85\u65f6",
+                "\u8bf7\u91cd\u65b0\u767b\u5f55",
+                "session expired",
+            )
+            text_lower = text.lower()
+            is_auth_code_error = (
+                "\u6388\u6743\u7801\u4e0d\u80fd\u4e3a\u7a7a" in text
+                or ("\u6388\u6743\u7801" in text and "\u4e0d\u80fd\u4e3a\u7a7a" in text)
+                or "auth code" in text_lower
+                or "authorization code" in text_lower
+            )
+            if is_auth_code_error:
+                logger.info(f"Not logged in: tax auth-code error url={redact_sensitive_text(url)}")
+                return False
+            if any(hint in text for hint in session_expired_hints):
+                logger.info(f"Not logged in: tax bureau session expired url={redact_sensitive_text(url)}")
+                return False
             if any(hint in text for hint in logged_in_hints):
-                logger.info(f"Login detected: logged-in tax bureau content found ({url})")
+                logger.info(f"Login detected: logged-in tax bureau content found ({redact_sensitive_text(url)})")
                 return True
             if any(hint in text for hint in login_only_hints):
-                logger.info(f"Not logged in: login form content found url={url}")
+                logger.info(f"Not logged in: login form content found url={redact_sensitive_text(url)}")
                 return False
         except Exception:
             pass
@@ -119,10 +149,10 @@ class LoginDetector:
 
         # Logged in if: on main page AND not on login page
         if on_main and not_on_login:
-            logger.info(f"Login detected: on main page ({url}), not on login page")
+            logger.info(f"Login detected: on main page ({redact_sensitive_text(url)}), not on login page")
             return True
 
-        logger.info(f"Not logged in: url={url}")
+        logger.info(f"Not logged in: url={redact_sensitive_text(url)}")
         return False
 
 

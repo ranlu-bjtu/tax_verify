@@ -150,7 +150,7 @@ def fetch_annual_settlement_web_values(task_id: str, province: str, args: argpar
             flow = TaskLoginFlow(
                 bm,
                 timeout=args.tax_timeout,
-                login_strategy=getattr(args, "tax_login_strategy", "direct_first"),
+                login_strategy=getattr(args, "tax_login_strategy", "plugin_first"),
             )
             tax_page, info = flow.login(chanjet_page, task_id)
             province = info.province or province
@@ -331,29 +331,45 @@ def fill_annual_query_filters(page, window: dict[str, str], include_period: bool
             if (comp) {
                 const formData = comp.$data.formData;
                 Object.assign(formData, {
-                    yzpzzlDm: 'BDA0610994',
+                    yzpzzlDm: '',
                     gzlx: ['1', '5'],
                     zfbz: 'N',
                     sbrqq: window.declaration_start,
                     sbrqz: window.declaration_end,
-                    skssqq: window.period_start,
-                    skssqz: window.period_end,
+                    skssqq: includePeriod ? window.period_start : '',
+                    skssqz: includePeriod ? window.period_end : '',
                     pageNum: 1,
-                    pageSize: formData.pageSize || 30
+                    pageSize: Math.max(Number(formData.pageSize || 30), 100)
                 });
-                for (const item of comp.$data.querySearchConfig || []) {
-                    if (Object.prototype.hasOwnProperty.call(formData, item.key)) {
-                        item.value = formData[item.key];
+                const syncQueryConfig = () => {
+                    for (const item of comp.$data.querySearchConfig || []) {
+                        if (Object.prototype.hasOwnProperty.call(formData, item.key)) {
+                            item.value = formData[item.key];
+                        }
                     }
+                };
+                const runQuery = async () => {
+                    syncQueryConfig();
+                    const ret = comp.DescribeSbmxcx2(formData);
+                    if (ret && typeof ret.then === 'function') await ret;
+                    const deadline = Date.now() + 15000;
+                    while (Date.now() < deadline && comp.$data.isLoading) await wait(300);
+                    await wait(1000);
+                    return Array.isArray(comp.$data.data) ? comp.$data.data : [];
+                };
+                let rows = await runQuery();
+                let exactCount = exactRows(rows).length;
+                const total = Number(comp.$data.pagination && comp.$data.pagination.total || rows.length || 0);
+                const pageSize = Math.max(Number(formData.pageSize || 30), 1);
+                const maxPage = Math.max(1, Math.ceil(total / pageSize));
+                let pagesChecked = 1;
+                for (let pageNum = 2; exactCount <= 0 && pageNum <= maxPage; pageNum += 1) {
+                    formData.pageNum = pageNum;
+                    rows = await runQuery();
+                    pagesChecked += 1;
+                    exactCount = exactRows(rows).length;
                 }
-                const ret = comp.DescribeSbmxcx2();
-                if (ret && typeof ret.then === 'function') await ret;
-                const deadline = Date.now() + 15000;
-                while (Date.now() < deadline && comp.$data.isLoading) await wait(300);
-                await wait(1000);
-                const rows = Array.isArray(comp.$data.data) ? comp.$data.data : [];
-                const total = comp.$data.pagination && comp.$data.pagination.total;
-                return `vue_query:period=${includePeriod ? 'yes' : 'no'};total=${total ?? rows.length};rows=${rows.length};exact=${exactRows(rows).length}`;
+                return `vue_query:period=${includePeriod ? 'yes' : 'no'};total=${total};rows=${rows.length};page=${formData.pageNum};pagesChecked=${pagesChecked};exact=${exactCount}`;
             }
 
             const setValue = (input, value) => {
@@ -408,26 +424,20 @@ def fill_annual_query_filters(page, window: dict[str, str], include_period: bool
                 }
                 return `no_input:${labels[0]}`;
             };
-            const fillFormType = async () => {
+            const clearFormType = async () => {
                 const container = findContainerByLabel(['\\u7533\\u62a5\\u8868\\u79cd\\u7c7b', '\\u7533\\u62a5\\u8868\\u7c7b\\u578b', '\\u7533\\u62a5\\u8868\\u540d\\u79f0']);
-                if (!container) return 'form_type_label_missing';
-                const trigger = Array.from(container.querySelectorAll('input:not([type=hidden]), .el-select, .ant-select, .t-select, [role=combobox]'))
+                if (!container) return 'form_type_not_set';
+                const clearButtons = Array.from(container.querySelectorAll(
+                    '.el-select__caret.el-icon-circle-close, .el-tag__close, .ant-select-clear, .t-tag__icon-close, [aria-label="clear"], [aria-label="Clear"]'
+                )).filter(visible);
+                if (clearButtons.length) {
+                    clearButtons.forEach((button) => button.click());
+                    await wait(300);
+                }
+                const trigger = Array.from(container.querySelectorAll('input:not([type=hidden]), .el-select input:not([type=hidden]), .ant-select input:not([type=hidden]), .t-select input:not([type=hidden]), [role=combobox] input:not([type=hidden])'))
                     .filter(visible)[0];
-                if (!trigger) return 'form_type_trigger_missing';
-                trigger.click();
-                if (trigger.tagName === 'INPUT') setValue(trigger, 'BDA0610994');
-                await wait(1000);
-                const options = Array.from(document.querySelectorAll('.el-select-dropdown__item, .ant-select-item, .t-select-option, .t-option, li, [role=option], div'))
-                    .filter((el) => visible(el) && normalize(el.innerText || el.textContent).length <= 300);
-                const option = options.find((el) => {
-                    const text = normalize(el.innerText || el.textContent);
-                    return text.includes('BDA0610994') || (text.includes('A100000') && text.includes('\\u4f01\\u4e1a\\u6240\\u5f97\\u7a0e\\u5e74\\u5ea6'));
-                });
-                if (!option) return 'form_type_option_missing';
-                option.scrollIntoView({ block: 'center' });
-                option.click();
-                await wait(500);
-                return 'form_type_selected';
+                if (trigger && trigger.tagName === 'INPUT') setValue(trigger, '');
+                return 'form_type_cleared';
             };
 
             const results = [];
@@ -435,7 +445,7 @@ def fill_annual_query_filters(page, window: dict[str, str], include_period: bool
             if (includePeriod) {
                 results.push(fillRange(['\\u7a0e\\u6b3e\\u6240\\u5c5e\\u671f'], [window.period_start, window.period_end]));
             }
-            results.push(await fillFormType());
+            results.push(await clearFormType());
             await wait(500);
             results.push(`query=${clickByText(['\\u67e5\\u8be2', '\\u641c\\u7d22']) || 'missing'}`);
             await wait(5000);
@@ -841,7 +851,7 @@ def save_cbj_report(
         "form_code": f"CBJ_{mode.upper()}",
         "form_name": form_name,
         "province": province,
-        "declaration_status": "\u5df2\u7533\u62a5" if mode == "annual_settlement" else "\u5df2\u53d6\u6570",
+        "declaration_status": "\u4e0d\u533a\u5206\u7533\u62a5\u72b6\u6001" if mode == "annual_settlement" else "\u5df2\u53d6\u6570",
         "summary": summary,
         "field_results": field_results,
         "timestamp": datetime.now().isoformat(),

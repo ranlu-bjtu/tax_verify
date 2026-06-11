@@ -10,6 +10,7 @@ from src.cbj.verification import (
     BackendField,
     annual_query_window,
     build_numeric_comparison,
+    fill_annual_query_filters,
     find_field,
     report_has_errors,
     save_cbj_report,
@@ -57,6 +58,30 @@ def test_cbj_numeric_comparison_detects_match_and_mismatch():
     assert mismatched["status"] == "mismatch"
 
 
+def test_annual_query_filters_do_not_preselect_form_type():
+    class FakePage:
+        def __init__(self):
+            self.script = ""
+            self.payload = None
+
+        def evaluate(self, script, payload):
+            self.script = script
+            self.payload = payload
+            return "ok"
+
+    page = FakePage()
+    window = annual_query_window(today=date(2026, 5, 12))
+
+    result = fill_annual_query_filters(page, window, include_period=True)
+
+    assert result == "ok"
+    assert page.payload == {"window": window, "includePeriod": True}
+    assert "yzpzzlDm: ''" in page.script
+    assert "fillFormType" not in page.script
+    assert "pagesChecked" in page.script
+    assert "DescribeSbmxcx2(formData)" in page.script
+
+
 def test_cbj_report_has_errors():
     with tempfile.TemporaryDirectory() as tmp:
         report = save_cbj_report(
@@ -74,5 +99,6 @@ if __name__ == "__main__":
     test_find_field_searches_flattened_and_raw_nodes()
     test_annual_query_window_uses_current_year_and_previous_tax_year()
     test_cbj_numeric_comparison_detects_match_and_mismatch()
+    test_annual_query_filters_do_not_preselect_form_type()
     test_cbj_report_has_errors()
     print("All CBJ verification tests passed!")

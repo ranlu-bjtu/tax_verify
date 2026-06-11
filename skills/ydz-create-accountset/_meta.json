@@ -1,0 +1,14 @@
+{
+  "name": "易代账建账套工具",
+  "description": "从报税后台成功任务提取企业和登录信息，在易代账集测或线上环境创建客户、账套并保存税务登录信息的可复用自动化工具。",
+  "type": "skill",
+  "category": "business-automation",
+  "tags": [
+    "yidaizhang",
+    "chanjet",
+    "accountset",
+    "customer-create",
+    "tax-backend"
+  ],
+  "author": "codex"
+}

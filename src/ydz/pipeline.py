@@ -19,6 +19,7 @@ class YdzPipeline:
         self,
         enterprise: str,
         cdp_port: int = 9222,
+        chrome_path: str = "",
         user_data_dir: str = "./browser_profile/etax_compare_forms",
         plugin_path: str = r"C:\Users\Administrator\Downloads\EtaxPlugin",
         poll_interval: int = 15,
@@ -27,6 +28,7 @@ class YdzPipeline:
         self.enterprise = enterprise
         self.session = YdzSession(
             cdp_port=cdp_port,
+            chrome_path=chrome_path or None,
             user_data_dir=user_data_dir,
             plugin_path=plugin_path,
             launch_if_needed=True,
@@ -59,16 +61,20 @@ class YdzPipeline:
                 LOGGER.info("Starting Yidaizhang collection for %s/%s", tax_no, period)
                 result = collector.collect_tax_no(tax_no=tax_no, period=period, force=force)
                 try:
-                    result.verify_task_id = resolver.resolve(tax_no, period, submitted_at=result.submitted_at)
-                    if resolver.last_task:
-                        result.resolved_task = {
-                            "taskId": resolver.last_task.task_id,
-                            "taskTypeId": resolver.last_task.task_type_id,
-                            "taskTypeName": resolver.last_task.task_type_name,
-                            "status": resolver.last_task.status,
-                            "period": resolver.last_task.period,
-                            "createdStamp": resolver.last_task.created_stamp,
+                    result.verify_task_ids = resolver.resolve_all(tax_no, period, submitted_at=result.submitted_at)
+                    result.verify_task_id = result.verify_task_ids[0] if result.verify_task_ids else None
+                    result.resolved_tasks = [
+                        {
+                            "taskId": task.task_id,
+                            "taskTypeId": task.task_type_id,
+                            "taskTypeName": task.task_type_name,
+                            "status": task.status,
+                            "period": task.period,
+                            "createdStamp": task.created_stamp,
                         }
+                        for task in resolver.last_tasks
+                    ]
+                    result.resolved_task = result.resolved_tasks[0] if result.resolved_tasks else None
                 except Exception as exc:
                     LOGGER.warning("Could not resolve collect taskId for %s/%s: %s", tax_no, period, exc)
                     result.warnings.append(f"Could not resolve collect taskId: {exc}")

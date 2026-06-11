@@ -28,6 +28,7 @@ console = Console()
 )
 @click.option("--mode", type=click.Choice(["auto", "connect", "launch"]), default="auto")
 @click.option("--cdp-port", default=9222, type=int, help="Chrome CDP port for real task runs.")
+@click.option("--chrome-path", default=r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 @click.option("--user-data-dir", default="./browser_profile/etax_compare_forms")
 @click.option("--plugin-path", default=r"C:\Users\Administrator\Downloads\EtaxPlugin")
 @click.option("--chanjet-timeout", default=300, type=int)
@@ -35,12 +36,18 @@ console = Console()
 @click.option(
     "--tax-login-strategy",
     type=click.Choice(["direct_first", "plugin_first"]),
-    default="direct_first",
-    help="Tax bureau login strategy for taskId verification.",
+    default="plugin_first",
+    help="Tax bureau login strategy for taskId verification. plugin_first is safer for province portals that require EtaxPlugin session cleanup.",
 )
 @click.option("--skip-api", is_flag=True, help="Only load workbook mappings; requires --targets not auto.")
 @click.option("--skip-browser", is_flag=True, help="Fetch API and mappings without opening tax pages.")
 @click.option("--skip-pdf", is_flag=True, help="Do not save a PDF copy of the compared tax page.")
+@click.option(
+    "--declaration-status-override",
+    type=click.Choice(["", "filed", "unfiled"]),
+    default="",
+    help="Use this declaration status only when task logs do not expose one.",
+)
 @click.option("--browser-lock-timeout", default=3600, type=int, help="Seconds to wait for the shared tax browser lock.")
 @click.option("--log-level", default="INFO")
 def main(
@@ -54,6 +61,7 @@ def main(
     targets: str,
     mode: str,
     cdp_port: int,
+    chrome_path: str,
     user_data_dir: str,
     plugin_path: str,
     chanjet_timeout: int,
@@ -62,6 +70,7 @@ def main(
     skip_api: bool,
     skip_browser: bool,
     skip_pdf: bool,
+    declaration_status_override: str,
     browser_lock_timeout: int,
     log_level: str,
 ):
@@ -85,6 +94,7 @@ def main(
             config=config,
             cdp_port=cdp_port,
             mode=mode,
+            chrome_path=chrome_path,
             user_data_dir=user_data_dir,
             plugin_path=plugin_path,
             chanjet_timeout=chanjet_timeout,
@@ -93,6 +103,7 @@ def main(
             skip_api=skip_api,
             skip_browser=skip_browser,
             skip_pdf=skip_pdf,
+            declaration_status_override=declaration_status_override,
             browser_lock_timeout=browser_lock_timeout,
             log_level=log_level,
         )
@@ -187,6 +198,7 @@ def run_real_task_compare(
     config: str,
     cdp_port: int,
     mode: str,
+    chrome_path: str,
     user_data_dir: str,
     plugin_path: str,
     chanjet_timeout: int,
@@ -195,6 +207,7 @@ def run_real_task_compare(
     skip_api: bool,
     skip_browser: bool,
     skip_pdf: bool,
+    declaration_status_override: str,
     browser_lock_timeout: int,
     log_level: str,
 ) -> int:
@@ -211,6 +224,7 @@ def run_real_task_compare(
         config_root=config_root,
         cdp_port=cdp_port,
         mode=mode,
+        chrome_path=chrome_path,
         user_data_dir=user_data_dir,
         plugin_path=plugin_path,
         chanjet_timeout=chanjet_timeout,
@@ -219,6 +233,7 @@ def run_real_task_compare(
         skip_api=skip_api,
         skip_browser=skip_browser,
         skip_pdf=skip_pdf,
+        declaration_status_override=declaration_status_override,
         log_level=log_level,
     )
     if skip_browser:

@@ -14,6 +14,10 @@ output/
 browser_profile/
 /runtime/
 tax_nos*.txt
+.DS_Store
+**/.DS_Store
+.~*
+ID终版/
 
 # Secrets & env
 .env
